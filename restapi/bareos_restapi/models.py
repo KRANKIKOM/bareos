@@ -428,6 +428,42 @@ class jobControl(BaseModel):
     migrationjob: Optional[str] = Field(None)
 
 
+class restoreBvfsControl(BaseModel):
+    """
+    Multi-select restore driven by Bareos's BVFS catalog tables. Build a
+    selection from fileids and/or dirids returned by .bvfs_lsdirs / .bvfs_lsfiles,
+    pass them to /control/jobs/restore-bvfs and Bareos materialises a single
+    restore job that covers the whole set — the proper analogue of bconsole's
+    interactive `mark file1 ; mark file2 ; done`.
+    """
+
+    client: str = Field(..., title="Restore data from this client")
+    restoreclient: Optional[str] = Field(
+        None, title="Restore data to this client (defaults to source client)"
+    )
+    where: Optional[str] = Field(
+        "/tmp/bareos-restore",
+        title="Destination path prefix. '/' = restore in place",
+        example="/tmp/bareos-restore",
+    )
+    replace: Optional[bareosReplaceOption] = Field(
+        "never", title="File replace policy", example="never"
+    )
+    jobids: str = Field(
+        ...,
+        title="JobIds (Full→Diff→Inc chain), comma-separated",
+        example="3,5,8",
+    )
+    fileids: List[int] = Field(
+        default_factory=list,
+        title="FileIds from .bvfs_lsfiles to include",
+    )
+    dirids: List[int] = Field(
+        default_factory=list,
+        title="DirIds from .bvfs_lsdirs to include (whole subtree)",
+    )
+
+
 class restoreJobControl(BaseModel):
     client: str = Field(..., title="Restore data from this client")
     where: Optional[pathlib.Path] = Field(

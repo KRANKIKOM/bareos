@@ -2012,3 +2012,223 @@ def read_director_time(
     else:
         response.status_code = 500
         return result
+
+
+# ---------- BVFS (Bacula Virtual File System) ----------
+# Bareos catalog tables exposing the backup contents as a navigable tree.
+# Together with /control/jobs/restore-bvfs this is the proper multi-select
+# restore path — the legacy /control/jobs/restore can only handle ONE file
+# OR ONE directory at a time (the Director protocol literally doesn't accept
+# pipe-separated or repeated path arguments).
+#
+# Auth: the same OAuth2 bearer token used by the other endpoints. All commands
+# are dispatched via the user's cached jsonDirector session.
+
+import time
+import random
+
+
+def _bvfs_call(current_user, cmd):
+    """Run a .bvfs_* (or restore) command and return the JSON director output."""
+    return current_user.jsonDirector.call(cmd)
+
+
+@app.post("/control/bvfs/update", tags=["bvfs", "control"])
+def bvfsUpdate(
+    *,
+    jobid: Optional[int] = Query(
+        None, title="JobId to refresh the path cache for. Omit to refresh everything.", ge=1
+    ),
+    response: Response,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Refresh the BVFS path cache (`.bvfs_update`). Idempotent — Bareos skips
+    work if the cache for the requested job is already current. Run this once
+    per fresh job before browsing dirs/files.
+    """
+    cmd = ".bvfs_update"
+    if jobid is not None:
+        cmd += " jobid=%d" % jobid
+    try:
+        _bvfs_call(current_user, cmd)
+    except Exception as e:
+        response.status_code = 500
+        return {
+            "message": "Could not run %s on director %s. Message: '%s'"
+            % (cmd, current_user.directorName, e)
+        }
+    return {"updated": True, "jobid": jobid}
+
+
+@app.get("/control/bvfs/dirs", tags=["bvfs", "control"])
+def bvfsLsDirs(
+    *,
+    jobid: str = Query(
+        ...,
+        title="JobId(s) to query, comma-separated. Use /control/bvfs/get_jobids to chain Full→Diff→Inc.",
+        example="3",
+    ),
+    path: str = Query(
+        "/",
+        title="Directory path to list (must end in / when browsing a subdir; root is /).",
+        example="/",
+    ),
+    limit: int = Query(2000, ge=1, le=10000),
+    offset: int = Query(0, ge=0),
+    autoupdate: bool = Query(
+        True, title="Run .bvfs_update first so cold jobs return data immediately."
+    ),
+    response: Response,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    List immediate subdirectories of `path` for the given JobIds
+    (`.bvfs_lsdirs`). Returns rows of (pathid, fileid, jobid, lstat, name).
+    """
+    if not path.endswith("/"):
+        path = path + "/"
+    try:
+        if autoupdate:
+            _bvfs_call(current_user, ".bvfs_update jobid=%s" % jobid)
+        result = _bvfs_call(
+            current_user,
+            ".bvfs_lsdirs jobid=%s path=%s limit=%d offset=%d" % (jobid, path, limit, offset),
+        )
+    except Exception as e:
+        response.status_code = 500
+        return {
+            "message": "Could not list dirs at %s for jobid=%s: %s" % (path, jobid, e)
+        }
+    return result
+
+
+@app.get("/control/bvfs/files", tags=["bvfs", "control"])
+def bvfsLsFiles(
+    *,
+    jobid: str = Query(..., title="JobId(s), comma-separated", example="3"),
+    path: str = Query(..., title="Directory path to list files in", example="/etc/"),
+    limit: int = Query(2000, ge=1, le=10000),
+    offset: int = Query(0, ge=0),
+    autoupdate: bool = Query(True),
+    response: Response,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    List files directly in `path` (`.bvfs_lsfiles`). Returns rows with the
+    `fileid` you need to pass to `/control/jobs/restore-bvfs`.
+    """
+    if not path.endswith("/"):
+        path = path + "/"
+    try:
+        if autoupdate:
+            _bvfs_call(current_user, ".bvfs_update jobid=%s" % jobid)
+        result = _bvfs_call(
+            current_user,
+            ".bvfs_lsfiles jobid=%s path=%s limit=%d offset=%d" % (jobid, path, limit, offset),
+        )
+    except Exception as e:
+        response.status_code = 500
+        return {
+            "message": "Could not list files at %s for jobid=%s: %s" % (path, jobid, e)
+        }
+    return result
+
+
+@app.get("/control/bvfs/get_jobids", tags=["bvfs", "control"])
+def bvfsGetJobIds(
+    *,
+    jobid: int = Query(..., title="Pivot JobId; returns the chain needed to restore it.", ge=1),
+    response: Response,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Resolve the JobId chain (Full→Diff→Inc) needed to restore the requested
+    JobId (`.bvfs_get_jobids`). Pass the resulting `jobids` string verbatim to
+    /control/bvfs/dirs and /control/jobs/restore-bvfs.
+    """
+    try:
+        result = _bvfs_call(current_user, ".bvfs_get_jobids jobid=%d" % jobid)
+    except Exception as e:
+        response.status_code = 500
+        return {"message": "Could not resolve jobid chain for %d: %s" % (jobid, e)}
+    return result
+
+
+@app.post("/control/jobs/restore-bvfs", tags=["jobcontrol", "control", "jobs", "bvfs"])
+def runRestoreJobBvfs(
+    *,
+    jobControl: restoreBvfsControl = Body(
+        ..., title="BVFS-driven multi-select restore", embed=True
+    ),
+    response: Response,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Multi-select restore driven by BVFS catalog IDs:
+      1. .bvfs_restore  — materialize a private temp table holding the chosen
+         file/dir ids
+      2. restore file=?<table>  — kick off ONE restore job that consumes the
+         temp table
+
+    Returns the spawned JobId. The legacy /control/jobs/restore endpoint can
+    only restore a single file or single directory; this one handles the
+    arbitrary multi-pick case Dr. Acula needs.
+    """
+    if not jobControl.fileids and not jobControl.dirids:
+        response.status_code = 422
+        return {"detail": "Either fileids or dirids must be non-empty"}
+
+    # Bareos requires the BVFS temp-table name to match `^b2[0-9]+$` strictly
+    # (core/src/cats/bvfs.cc CheckTemp — literal "b2" then pure digits, no
+    # underscores/hyphens/letters). Pack timestamp_ms + random_4d into one
+    # integer suffix for per-request uniqueness.
+    table_name = "b2%d%04d" % (int(time.time() * 1000), random.randint(0, 9999))
+
+    bvfs_parts = [
+        ".bvfs_restore",
+        "path=%s" % table_name,
+        "jobid=%s" % jobControl.jobids,
+    ]
+    if jobControl.fileids:
+        bvfs_parts.append("fileid=" + ",".join(str(x) for x in jobControl.fileids))
+    if jobControl.dirids:
+        bvfs_parts.append("dirid=" + ",".join(str(x) for x in jobControl.dirids))
+    bvfs_cmd = " ".join(bvfs_parts)
+
+    try:
+        _bvfs_call(current_user, bvfs_cmd)
+    except Exception as e:
+        response.status_code = 500
+        return {"message": "Could not prepare BVFS restore table: %s. Cmd: %s" % (e, bvfs_cmd)}
+
+    # Trigger the restore via the temp table reference "?<name>".
+    restore_parts = [
+        "restore",
+        "file=?%s" % table_name,
+        "client=%s" % jobControl.client,
+        "yes",
+    ]
+    if jobControl.restoreclient:
+        restore_parts.append("restoreclient=%s" % jobControl.restoreclient)
+    if jobControl.where:
+        restore_parts.append("where=%s" % jobControl.where)
+    if jobControl.replace:
+        rv = jobControl.replace.value if hasattr(jobControl.replace, "value") else jobControl.replace
+        restore_parts.append("replace=%s" % rv)
+    restore_cmd = " ".join(restore_parts)
+
+    try:
+        result = _bvfs_call(current_user, restore_cmd)
+    except Exception as e:
+        response.status_code = 500
+        return {
+            "message": "BVFS table prepared but restore start failed: %s. Cmd: %s" % (e, restore_cmd)
+        }
+    if "run" in result and "jobid" in result["run"]:
+        return {"jobid": int(result["run"]["jobid"]), "table": table_name}
+    response.status_code = 500
+    return {
+        "message": "Restore command returned no jobid. Result: %s" % result,
+        "table": table_name,
+    }

@@ -2024,8 +2024,74 @@ def read_director_time(
 # Auth: the same OAuth2 bearer token used by the other endpoints. All commands
 # are dispatched via the user's cached jsonDirector session.
 
+import re
 import time
 import random
+
+# Input validators. The Director's bconsole grammar is space-separated
+# key=value pairs, so unsanitized user input can override existing args (e.g.
+# `path=/etc/ jobid=666 client=victim`) and reach commands the user's Console
+# Profile would normally deny. We validate every user-controlled field with a
+# strict regex before interpolation.
+
+_RE_JOBIDS = re.compile(r"^[0-9]+(,[0-9]+)*$")
+_RE_RESOURCE = re.compile(r"^[A-Za-z0-9._-]+$")  # Bareos resource-name charset
+_RE_BVFS_PATH = re.compile(r"^/[^\s=;]*$")       # bvfs_ls* path: abs, no ws/=/;
+_RE_WHERE = re.compile(r"^/[^\s=;]*$")           # restore where: same as path
+_REPLACE_VALUES = {"always", "never", "ifolder", "ifnewer"}
+
+
+def _bad_request(response, msg):
+    response.status_code = 400
+    return {"detail": msg}
+
+
+def _validate_jobids(value):
+    if not value or not _RE_JOBIDS.match(value):
+        raise ValueError("jobid(s) must be a comma-separated list of integers")
+    return value
+
+
+def _validate_resource(name, label="name"):
+    if not name or not _RE_RESOURCE.match(name):
+        raise ValueError("%s must match [A-Za-z0-9._-]+" % label)
+    return name
+
+
+def _validate_bvfs_path(path):
+    if not _RE_BVFS_PATH.match(path):
+        raise ValueError(
+            "path must be absolute and contain no whitespace, '=', or ';'"
+        )
+    if not path.endswith("/"):
+        path = path + "/"
+    return path
+
+
+def _validate_where(where):
+    if not _RE_WHERE.match(where):
+        raise ValueError(
+            "where must be absolute and contain no whitespace, '=', or ';'"
+        )
+    return where
+
+
+def _validate_id_list(ids, label):
+    out = []
+    for x in ids:
+        if not isinstance(x, int) or x < 1:
+            raise ValueError("%s entries must be positive integers" % label)
+        out.append(str(x))
+    return ",".join(out)
+
+
+def _validate_replace(value):
+    if value is None:
+        return None
+    s = value.value if hasattr(value, "value") else value
+    if s not in _REPLACE_VALUES:
+        raise ValueError("replace must be one of %s" % sorted(_REPLACE_VALUES))
+    return s
 
 
 def _bvfs_call(current_user, cmd):
@@ -2068,6 +2134,7 @@ def bvfsLsDirs(
         ...,
         title="JobId(s) to query, comma-separated. Use /control/bvfs/get_jobids to chain Full→Diff→Inc.",
         example="3",
+        regex=r"^[0-9]+(,[0-9]+)*$",
     ),
     path: str = Query(
         "/",
@@ -2086,8 +2153,11 @@ def bvfsLsDirs(
     List immediate subdirectories of `path` for the given JobIds
     (`.bvfs_lsdirs`). Returns rows of (pathid, fileid, jobid, lstat, name).
     """
-    if not path.endswith("/"):
-        path = path + "/"
+    try:
+        jobid = _validate_jobids(jobid)
+        path = _validate_bvfs_path(path)
+    except ValueError as e:
+        return _bad_request(response, str(e))
     try:
         if autoupdate:
             _bvfs_call(current_user, ".bvfs_update jobid=%s" % jobid)
@@ -2106,7 +2176,12 @@ def bvfsLsDirs(
 @app.get("/control/bvfs/files", tags=["bvfs", "control"])
 def bvfsLsFiles(
     *,
-    jobid: str = Query(..., title="JobId(s), comma-separated", example="3"),
+    jobid: str = Query(
+        ...,
+        title="JobId(s), comma-separated",
+        example="3",
+        regex=r"^[0-9]+(,[0-9]+)*$",
+    ),
     path: str = Query(..., title="Directory path to list files in", example="/etc/"),
     limit: int = Query(2000, ge=1, le=10000),
     offset: int = Query(0, ge=0),
@@ -2118,8 +2193,11 @@ def bvfsLsFiles(
     List files directly in `path` (`.bvfs_lsfiles`). Returns rows with the
     `fileid` you need to pass to `/control/jobs/restore-bvfs`.
     """
-    if not path.endswith("/"):
-        path = path + "/"
+    try:
+        jobid = _validate_jobids(jobid)
+        path = _validate_bvfs_path(path)
+    except ValueError as e:
+        return _bad_request(response, str(e))
     try:
         if autoupdate:
             _bvfs_call(current_user, ".bvfs_update jobid=%s" % jobid)
@@ -2179,6 +2257,32 @@ def runRestoreJobBvfs(
         response.status_code = 422
         return {"detail": "Either fileids or dirids must be non-empty"}
 
+    # Validate every user-controlled field BEFORE building any bconsole command.
+    # bconsole splits on whitespace, so unescaped values could inject extra args
+    # and bypass the user's Console Profile ACL.
+    try:
+        jobids = _validate_jobids(jobControl.jobids)
+        client = _validate_resource(jobControl.client, "client")
+        restoreclient = (
+            _validate_resource(jobControl.restoreclient, "restoreclient")
+            if jobControl.restoreclient
+            else None
+        )
+        where = _validate_where(jobControl.where) if jobControl.where else None
+        replace = _validate_replace(jobControl.replace)
+        fileid_arg = (
+            _validate_id_list(jobControl.fileids, "fileids")
+            if jobControl.fileids
+            else ""
+        )
+        dirid_arg = (
+            _validate_id_list(jobControl.dirids, "dirids")
+            if jobControl.dirids
+            else ""
+        )
+    except ValueError as e:
+        return _bad_request(response, str(e))
+
     # Bareos requires the BVFS temp-table name to match `^b2[0-9]+$` strictly
     # (core/src/cats/bvfs.cc CheckTemp — literal "b2" then pure digits, no
     # underscores/hyphens/letters). Pack timestamp_ms + random_4d into one
@@ -2188,12 +2292,12 @@ def runRestoreJobBvfs(
     bvfs_parts = [
         ".bvfs_restore",
         "path=%s" % table_name,
-        "jobid=%s" % jobControl.jobids,
+        "jobid=%s" % jobids,
     ]
-    if jobControl.fileids:
-        bvfs_parts.append("fileid=" + ",".join(str(x) for x in jobControl.fileids))
-    if jobControl.dirids:
-        bvfs_parts.append("dirid=" + ",".join(str(x) for x in jobControl.dirids))
+    if fileid_arg:
+        bvfs_parts.append("fileid=" + fileid_arg)
+    if dirid_arg:
+        bvfs_parts.append("dirid=" + dirid_arg)
     bvfs_cmd = " ".join(bvfs_parts)
 
     try:
@@ -2206,16 +2310,15 @@ def runRestoreJobBvfs(
     restore_parts = [
         "restore",
         "file=?%s" % table_name,
-        "client=%s" % jobControl.client,
+        "client=%s" % client,
         "yes",
     ]
-    if jobControl.restoreclient:
-        restore_parts.append("restoreclient=%s" % jobControl.restoreclient)
-    if jobControl.where:
-        restore_parts.append("where=%s" % jobControl.where)
-    if jobControl.replace:
-        rv = jobControl.replace.value if hasattr(jobControl.replace, "value") else jobControl.replace
-        restore_parts.append("replace=%s" % rv)
+    if restoreclient:
+        restore_parts.append("restoreclient=%s" % restoreclient)
+    if where:
+        restore_parts.append("where=%s" % where)
+    if replace:
+        restore_parts.append("replace=%s" % replace)
     restore_cmd = " ".join(restore_parts)
 
     try:

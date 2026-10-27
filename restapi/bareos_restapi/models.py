@@ -592,6 +592,22 @@ class jobDefs(jobResource):
     jobdefs: Optional[str] = Field(None, title="Jobdefs to use", example="DefaultJob")
 
 
+class jobUpdate(jobResource):
+    """
+    Desired state for PUT /configuration/jobs/{name} (partial, merge semantics).
+
+    jobResource marks messages/name/pool/jobdefs/type as required for create;
+    on a modify you send only what changes, so all of them become optional here
+    and unspecified directives are preserved on disk.
+    """
+
+    messages: Optional[str] = Field(None, title="Message resource identifier")
+    name: Optional[str] = Field(None, title="Name for this resource")
+    pool: Optional[str] = Field(None, title="Pool for this job")
+    jobdefs: Optional[str] = Field(None, title="Jobdefs to use")
+    type: Optional[str] = Field(None, title="Job type")
+
+
 class clientResource(tlsSettings):
     name: str
     address: str
@@ -624,6 +640,44 @@ class clientResource(tlsSettings):
     ndmploglevel: Optional[PositiveInt] = Field(None)
     ndmpblocksize: Optional[PositiveInt] = Field(None)
     ndmpuselmdb: Optional[bareosBool] = Field(None)
+
+
+class clientUpdate(clientResource):
+    """
+    Desired state for PUT /configuration/clients/{name}.
+
+    Identical to clientResource except that ``password`` is optional: on a
+    modify the FD's shared secret is usually unchanged, and the plaintext isn't
+    recoverable from the UI (``show`` only returns the hash). When omitted, the
+    endpoint keeps the password already on disk.
+    """
+
+    name: Optional[str] = Field(None, title="Client name (URL path is authoritative)")
+    address: Optional[str] = Field(None, title="Client address")
+    password: Optional[str] = Field(
+        None, title="New FD password; omit to keep the current one"
+    )
+
+
+class clientCreate(clientResource):
+    """
+    Body for POST /configuration/clients.
+
+    ``password`` is optional when the API has a ClusterSecret configured: it is
+    then derived exactly like the Ansible bareos_fd role does,
+    sha256(ClusterSecret + hostname + "fd"), so API-created clients and
+    Ansible-installed FDs agree without anyone typing a password. ``hostname``
+    is only an input to that derivation (the FD host's short hostname) and is
+    never written to the resource; it defaults to the first label of
+    ``address`` (or the client name without a trailing "-fd" for IPs).
+    """
+
+    password: Optional[str] = Field(
+        None, title="FD password; omit to derive it from the cluster secret"
+    )
+    hostname: Optional[str] = Field(
+        None, title="Short hostname used for password derivation"
+    )
 
 
 class deviceResource(tlsSettings):

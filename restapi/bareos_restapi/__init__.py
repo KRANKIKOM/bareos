@@ -25,6 +25,7 @@
 #
 
 import configparser
+import hashlib
 from datetime import datetime, timedelta
 from fastapi import Depends, FastAPI, HTTPException, status, Response, Path, Body, Query
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -47,6 +48,20 @@ config.read("api.ini")
 CONFIG_DIRECTOR_ADDRESS = config.get("Director", "Address")
 CONFIG_DIRECTOR_NAME = config.get("Director", "Name")
 CONFIG_DIRECTOR_PORT = config.getint("Director", "Port")
+# Directory the director loads resource files from (the `@` include tree that
+# `configure add` and the Ansible bareos_fd role both write into). Required for
+# modify/delete of clients, since bconsole has no `configure modify|delete` —
+# we edit the resource file on disk and `reload`. The restapi runs co-located
+# with the director, so it has filesystem access to this path.
+CONFIG_DIRECTOR_RESOURCE_DIR = config.get(
+    "Director", "ResourceDir", fallback="/etc/bareos/bareos-dir.d"
+)
+# Shared cluster secret the Ansible roles derive every inter-daemon password
+# from (bareos_common_cluster_secret). With it set, a client created through
+# the API gets the SAME password the FD side would get from Ansible (or can be
+# told via /configuration/clients/{name}/fd-config): sha256(secret+host+"fd").
+# Empty = no derivation; POST /configuration/clients then requires a password.
+CONFIG_CLUSTER_SECRET = config.get("Director", "ClusterSecret", fallback="")
 
 SECRET_KEY = config.get("JWT", "secret_key")
 ALGORITHM = config.get("JWT", "algorithm")
@@ -490,6 +505,83 @@ def read_catalog_info_for_particular_client(
     return {"item_id": item_id}
 
 
+@app.get("/control/clients/{client_name}/status", tags=["clients", "control"])
+def client_health(
+    *,
+    client_name: str = Path(..., title="Client (name) to health-check"),
+    response: Response,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Live health check for one client (FD).
+
+    Runs `status client=<name>`, which makes the Director open a connection to
+    the file daemon and authenticate. That single probe answers both questions
+    a setup/overview view needs:
+      - reachable: the FD is up and accepting connections (ping), and
+      - the Director's credentials for it are accepted (login works).
+
+    A failure to connect or authenticate is reported as `reachable: false` with
+    the Director's message — it is NOT a 5xx, since "client is down" is a valid,
+    expected answer to a health check.
+
+    Uses a raw (non-JSON) console: the Director's JSON API does not serialize
+    the `status client` subcommand (it returns `{}` for up and down alike), so
+    the JSON console can't tell them apart. The raw text carries the FD's
+    version/uptime banner on success and a connect/auth error on failure.
+    """
+    try:
+        name = _validate_resource(client_name, "client name")
+    except ValueError as e:
+        response.status_code = 400
+        return {"detail": str(e)}
+
+    raw_console = None
+    try:
+        raw_console = bareos.bsock.DirectorConsole(
+            address=CONFIG_DIRECTOR_ADDRESS,
+            port=CONFIG_DIRECTOR_PORT,
+            dirname=CONFIG_DIRECTOR_NAME,
+            name=current_user.username,
+            password=bareos.bsock.Password(current_user.password),
+        )
+        result = raw_console.call("status client=%s" % name)
+    except Exception as e:
+        return {"name": name, "reachable": False, "message": str(e)}
+    finally:
+        if raw_console is not None:
+            try:
+                raw_console.close()
+            except Exception:
+                pass
+
+    text = result.decode("utf-8", "replace") if isinstance(result, bytes) else str(result)
+    low = text.lower()
+    failure_markers = (
+        "failed to connect",
+        "bnet_connect",
+        "cannot connect",
+        "could not connect",
+        "connection refused",
+        "unable to authenticate",
+        "authorization key rejected",
+        "no such client",
+    )
+    success_markers = ("daemon started", "handshake:")
+    if any(m in low for m in failure_markers):
+        reachable = False
+    elif any(m in low for m in success_markers) or ("%s version:" % name.lower()) in low:
+        reachable = True
+    else:
+        reachable = False
+
+    # Keep the reply small; the banner (version/OS/uptime) is the useful part.
+    snippet = text.strip()
+    if len(snippet) > 600:
+        snippet = snippet[:600] + " …"
+    return {"name": name, "reachable": reachable, "message": snippet}
+
+
 @app.put(
     "/control/clients/enable/{client_name}",
     status_code=204,
@@ -574,19 +666,522 @@ def read_client_by_name(
     )
 
 
+def _derivation_hostname(name, address, hostname=None):
+    """
+    Short hostname for password derivation — what Ansible calls
+    ansible_hostname. Explicit `hostname` wins; otherwise the first DNS label of
+    `address`; for an IP address the client name minus a trailing "-fd".
+    """
+    if hostname:
+        return hostname.strip()
+    addr = (address or "").strip()
+    if addr:
+        import ipaddress
+
+        try:
+            ipaddress.ip_address(addr)
+        except ValueError:
+            return addr.split(".")[0]
+    return name[:-3] if name.lower().endswith("-fd") else name
+
+
+def _derive_fd_password(hostname):
+    """sha256(ClusterSecret + hostname + "fd") — identical to the bareos_fd role."""
+    return hashlib.sha256(
+        (CONFIG_CLUSTER_SECRET + hostname + "fd").encode("utf-8")
+    ).hexdigest()
+
+
 @app.post("/configuration/clients", tags=["clients", "configuration"])
 def post_client(
     *,
-    clientDef: clientResource = Body(..., title="The client to create"),
+    clientDef: clientCreate = Body(..., title="The client to create"),
     response: Response,
     current_user: User = Depends(get_current_user),
 ):
-    return configure_add_standard_component(
-        componentDef=clientDef,
+    """
+    Create a client (`configure add client`). The director writes it to
+    <ResourceDir>/client/<name>.conf, so it persists across restarts.
+
+    Without a password it is derived from the cluster secret (see
+    clientCreate). The plaintext is not returned here — fetch the FD-side
+    block via GET /configuration/clients/{name}/fd-config.
+    """
+    data = clientDef.dict()
+    hostname = data.pop("hostname", None)
+    derived_from = None
+    if not data.get("password"):
+        if not CONFIG_CLUSTER_SECRET:
+            response.status_code = 400
+            return {
+                "message": "password is required (no ClusterSecret configured "
+                "for password derivation)"
+            }
+        derived_from = _derivation_hostname(data["name"], data.get("address"), hostname)
+        try:
+            _validate_resource(derived_from, "hostname")
+        except ValueError as e:
+            response.status_code = 400
+            return {"message": str(e)}
+        data["password"] = _derive_fd_password(derived_from)
+
+    result = configure_add_standard_component(
+        componentDef=clientResource(**data),
         response=response,
         current_user=current_user,
         componentType="client",
     )
+    if derived_from and isinstance(result, dict) and (response.status_code or 200) < 400:
+        result = dict(result)
+        result["passwordDerivedFrom"] = derived_from
+    return result
+
+
+@app.get(
+    "/configuration/clients/{clients_name}/fd-config",
+    tags=["clients", "configuration"],
+)
+def read_client_fd_config(
+    *,
+    clients_name: str = Path(..., title="Client name"),
+    response: Response,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    The `Director { … }` block the file daemon needs to accept this director —
+    the half of onboarding the API can't do itself. For a legacy bacula-fd it
+    is the extra block in bacula-fd.conf; when the client resource has TLS off
+    (bacula-fd 5.2.6 can't do TLS-PSK) the snippet turns TLS off as well.
+
+    The password comes from the client's resource file (stored in plaintext
+    there; `show client` only exposes a hash).
+    """
+    try:
+        name = _validate_resource(clients_name, "client name")
+        path = _resource_file_path("client", name)
+    except ValueError as e:
+        response.status_code = 400
+        return {"message": str(e)}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        response.status_code = 404
+        return {"message": "No resource file for client %s at %s" % (name, path)}
+    except OSError as e:
+        response.status_code = 500
+        return {"message": "Could not read %s: %s" % (path, e)}
+
+    pw = re.search(r'^\s*Password\s*=\s*"?([^"\n]*?)"?\s*$', text, re.I | re.M)
+    if not pw or not pw.group(1):
+        response.status_code = 409
+        return {"message": "No password found in %s" % path}
+    password = pw.group(1)
+    if password.startswith("[md5]"):
+        response.status_code = 409
+        return {"message": "Password in %s is hashed; plaintext not recoverable" % path}
+    tls = re.search(r"^\s*TLS\s*Enable\s*=\s*(\w+)", text, re.I | re.M)
+    tls_off = bool(tls) and tls.group(1).lower() in ("no", "false", "0")
+
+    lines = [
+        "Director {",
+        "  Name = %s" % CONFIG_DIRECTOR_NAME,
+        '  Password = "%s"' % password,
+    ]
+    if tls_off:
+        lines += ["  TLS Enable = no", "  TLS Require = no"]
+    lines.append("}")
+    return {
+        "name": name,
+        "director": CONFIG_DIRECTOR_NAME,
+        "tlsDisabled": tls_off,
+        "config": "\n".join(lines) + "\n",
+    }
+
+
+# ---------- Client modify / delete (file-based) ----------
+# bconsole's `configure` command only supports `add` and `export` (see
+# core/src/dird/ua_configure.cc) — there is no `modify` or `delete`. Both
+# `configure add` and the Ansible bareos_fd role write one resource file per
+# client to <ResourceDir>/client/<name>.conf, so modify == rewrite that file
+# and delete == remove it; a `reload` makes the director pick up the change.
+# Validation reuses _validate_resource() (defined with the BVFS validators
+# below): the resource-name charset [A-Za-z0-9._-]+ has no path separator, and
+# _resource_file_path() additionally refuses any path that escapes ResourceDir.
+
+
+def _resource_file_path(componentType, name):
+    """
+    Absolute path of a resource file: <ResourceDir>/<componentType>/<name>.conf.
+
+    Defense in depth: the resolved path must stay directly inside
+    <ResourceDir>/<componentType>, so a crafted name can never escape the
+    directory even if the name charset check is ever loosened.
+    """
+    base = os.path.realpath(
+        os.path.join(CONFIG_DIRECTOR_RESOURCE_DIR, componentType)
+    )
+    target = os.path.realpath(os.path.join(base, name + ".conf"))
+    if os.path.dirname(target) != base:
+        raise ValueError("resolved resource path escapes %s" % base)
+    return target
+
+
+def _format_directive_value(value):
+    """Render one directive value for a Bareos resource file."""
+    # bareosBool is a str-Enum, so test it before the generic str branch.
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, bareosBool):
+        return value.value
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        return ", ".join('"%s"' % str(v) for v in value)
+    s = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return '"%s"' % s
+
+
+# Client-resource directive aliases (from core/src/dird/dird_conf.cc,
+# client_items[]). Normalizing these to the canonical name keeps a merge from
+# emitting both the alias and the canonical directive: the Ansible bareos_fd
+# role writes `FDPort`, our model uses `port` — the same underlying directive.
+_CLIENT_ALIASES = {
+    "fdport": "port",
+    "fdaddress": "address",
+    "fdpassword": "password",
+}
+
+
+# Jobs need no alias normalization — the bareos_config role's Job template and
+# the jobResource model already agree on directive names (Client, FileSet,
+# Pool, Schedule, JobDefs, RunBeforeJob, ...). Kept explicit for symmetry and
+# so a future alias can be added without touching call sites.
+_JOB_ALIASES = {}
+
+
+def _norm_directive_key(key, aliases):
+    """Canonical directive key: lowercased, whitespace-stripped, alias-resolved."""
+    norm = re.sub(r"\s+", "", key).lower()
+    return aliases.get(norm, norm)
+
+
+def _parse_resource_directives(content, aliases):
+    """
+    Parse a flat resource block into an ordered list of (key, raw_value): keys
+    canonicalized via _norm_directive_key, values kept verbatim (quotes and
+    all). Adequate for the resources we manage (Client, Job) — they carry no
+    nested sub-blocks in the files `configure add` / Ansible write.
+    """
+    directives = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.endswith("{") or stripped == "}":
+            continue
+        if "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        directives.append((_norm_directive_key(key, aliases), value.strip()))
+    return directives
+
+
+def _merge_resource_block(resourceType, current, overrides, forced_name, aliases):
+    """
+    Merge `overrides` (canonical key -> already-formatted value) into the
+    directives parsed from `current` and return (rendered_block, keys_present).
+
+    Unspecified directives are preserved verbatim, so a partial modify never
+    silently drops settings; `name` is forced (URL is authoritative) and
+    emitted first. keys_present lets the caller assert required directives
+    (e.g. a client password) survived the merge.
+    """
+    seen = set()
+    lines = ["%s {" % resourceType]
+    lines.append("  Name = %s" % forced_name)
+    seen.add("name")
+    for key, raw in _parse_resource_directives(current, aliases):
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append("  %s = %s" % (key, overrides.get(key, raw)))
+    for key, val in overrides.items():
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append("  %s = %s" % (key, val))
+    lines.append("}")
+    return "\n".join(lines) + "\n", seen
+
+
+def _write_resource_file(path, content):
+    """Atomically write a resource file with director-readable permissions."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(content)
+    os.chmod(tmp, 0o640)
+    os.replace(tmp, path)
+
+
+def _reload_after(current_user, response, path, rollback_content, action):
+    """
+    Reload the director after a resource-file change. On reload failure, restore
+    rollback_content (or delete the file when None) so the on-disk config and
+    the director's in-memory config never diverge. Returns the reload payload.
+    """
+    try:
+        result = current_user.jsonDirector.call("reload")
+    except Exception as e:
+        try:
+            if rollback_content is None:
+                if os.path.isfile(path):
+                    os.remove(path)
+            else:
+                _write_resource_file(path, rollback_content)
+        except OSError:
+            pass
+        response.status_code = 500
+        return {
+            "message": "%s but director reload failed (rolled back). Message: '%s'"
+            % (action, e)
+        }
+    if isinstance(result, dict) and "reload" in result:
+        return result["reload"]
+    return result
+
+
+def _modify_resource(
+    *,
+    response,
+    current_user,
+    componentType,
+    resourceType,
+    name_raw,
+    data,
+    aliases,
+    required_keys=(),
+):
+    """
+    Shared merge-modify for file-based resources (Client, Job). Merges the
+    non-null fields of `data` into <ResourceDir>/<componentType>/<name>.conf and
+    reloads. required_keys are directives that must be present after the merge
+    (e.g. a client's password) — a friendly 400 beats a reload failure.
+    """
+    try:
+        name = _validate_resource(name_raw, "%s name" % componentType)
+        path = _resource_file_path(componentType, name)
+    except ValueError as e:
+        response.status_code = 400
+        return {"detail": str(e)}
+
+    if not os.path.isfile(path):
+        response.status_code = 404
+        return {
+            "detail": "%s '%s' does not exist. Use POST to create it."
+            % (resourceType, name)
+        }
+
+    body_name = data.get("name")
+    if body_name is not None:
+        try:
+            if _validate_resource(str(body_name), "name") != name:
+                raise ValueError("mismatch")
+        except ValueError:
+            response.status_code = 400
+            return {
+                "detail": "Body name '%s' does not match URL '%s'."
+                % (body_name, name)
+            }
+
+    with open(path, "r") as fh:
+        current = fh.read()
+
+    overrides = {}
+    for key, value in data.items():
+        if key == "name" or value is None:
+            continue
+        overrides[_norm_directive_key(key, aliases)] = _format_directive_value(value)
+
+    block, keys_present = _merge_resource_block(
+        resourceType, current, overrides, _format_directive_value(name), aliases
+    )
+    for req in required_keys:
+        if req not in keys_present:
+            response.status_code = 400
+            return {
+                "detail": "'%s' is required (not on disk or in the request)." % req
+            }
+
+    try:
+        _write_resource_file(path, block)
+    except OSError as e:
+        response.status_code = 500
+        return {"detail": "Could not write %s '%s': %s" % (componentType, name, e)}
+
+    reload_result = _reload_after(
+        current_user, response, path, current, "Updated %s '%s'" % (componentType, name)
+    )
+    if response.status_code is not None and response.status_code >= 400:
+        return reload_result
+    return {"message": "%s '%s' updated." % (resourceType, name), "reload": reload_result}
+
+
+def _delete_resource(*, response, current_user, componentType, resourceType, name_raw):
+    """
+    Shared delete for file-based resources: remove
+    <ResourceDir>/<componentType>/<name>.conf and reload. A reload failure
+    (e.g. something still references the resource) rolls the file back.
+    """
+    try:
+        name = _validate_resource(name_raw, "%s name" % componentType)
+        path = _resource_file_path(componentType, name)
+    except ValueError as e:
+        response.status_code = 400
+        return {"detail": str(e)}
+
+    if not os.path.isfile(path):
+        response.status_code = 404
+        return {"detail": "No %s resource file for '%s'." % (componentType, name)}
+
+    try:
+        with open(path, "r") as fh:
+            backup = fh.read()
+        os.remove(path)
+    except OSError as e:
+        response.status_code = 500
+        return {"detail": "Could not remove %s '%s': %s" % (componentType, name, e)}
+
+    reload_result = _reload_after(
+        current_user, response, path, backup, "Removed %s '%s'" % (componentType, name)
+    )
+    if response.status_code is not None and response.status_code >= 400:
+        return reload_result
+    return {"message": "%s '%s' deleted." % (resourceType, name), "reload": reload_result}
+
+
+@app.put("/configuration/clients/{clients_name}", tags=["clients", "configuration"])
+def put_client(
+    *,
+    clients_name: str = Path(..., title="Client (name) to modify"),
+    clientDef: clientUpdate = Body(..., title="Desired client state"),
+    response: Response,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Modify a client resource (partial, merge semantics).
+
+    bconsole has no `configure modify`, so the fields you send are merged into
+    the resource file at <ResourceDir>/client/<name>.conf and the director is
+    reloaded. Directives you omit are preserved — in particular, omit
+    `password` to keep the current FD secret (a `show` only exposes the hash,
+    so the UI can't resend the plaintext). The client must already exist — use
+    POST /configuration/clients to create. The URL {clients_name} is
+    authoritative; a `name` in the body must match it (there is no rename).
+    """
+    return _modify_resource(
+        response=response,
+        current_user=current_user,
+        componentType="client",
+        resourceType="Client",
+        name_raw=clients_name,
+        data=clientDef.dict(),
+        aliases=_CLIENT_ALIASES,
+        required_keys=("password",),
+    )
+
+
+@app.delete(
+    "/configuration/clients/{clients_name}", tags=["clients", "configuration"]
+)
+def delete_client(
+    *,
+    clients_name: str = Path(..., title="Client (name) to delete"),
+    response: Response,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Delete a client resource from the director.
+
+    bconsole has no `configure delete`, so the resource file at
+    <ResourceDir>/client/<name>.conf is removed and the director reloaded.
+
+    NOTE: if a Job or JobDefs still references this client the reload will
+    report a configuration error and the delete is rolled back — remove or
+    repoint those jobs first.
+    """
+    return _delete_resource(
+        response=response,
+        current_user=current_user,
+        componentType="client",
+        resourceType="Client",
+        name_raw=clients_name,
+    )
+
+
+### catalogs
+
+
+@app.get("/configuration/catalogs", tags=["catalogs", "configuration"])
+def read_all_catalogs(
+    *,
+    response: Response,
+    current_user: User = Depends(get_current_user),
+    verbose: Optional[bareosBool] = Query("yes", title="Verbose output"),
+):
+    """
+    Read all catalog resources. Built on console command _show catalogs_.
+    Used by the UI to populate the client's Catalog dropdown.
+    """
+    return show_configuration_items(
+        response=response,
+        current_user=current_user,
+        itemType="catalogs",
+        verbose=verbose,
+    )
+
+
+### resource ownership (hybrid: Ansible baseline vs UI deltas)
+
+
+def _scan_ansible_managed(componentType):
+    """
+    Map <name> -> bool for every <ResourceDir>/<componentType>/<name>.conf,
+    where bool is whether the file carries the ANSIBLE-MANAGED marker (same
+    convention the bareos_config reaper matches). Lets the UI lock editing of
+    Ansible-owned resources so a UI change can't be silently reverted by the
+    next Ansible run. A resource created via `configure add` that isn't on this
+    node's disk simply won't appear (treated as unmanaged by the caller).
+    """
+    out = {}
+    base = os.path.realpath(os.path.join(CONFIG_DIRECTOR_RESOURCE_DIR, componentType))
+    if not os.path.isdir(base):
+        return out
+    for filename in os.listdir(base):
+        if not filename.endswith(".conf"):
+            continue
+        name = filename[: -len(".conf")]
+        try:
+            with open(os.path.join(base, filename), "r") as fh:
+                out[name] = "ANSIBLE-MANAGED" in fh.read()
+        except OSError:
+            continue
+    return out
+
+
+@app.get("/configuration/managed-resources", tags=["configuration"])
+def managed_resources(
+    *,
+    response: Response,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Report which client/job resource files are Ansible-managed (carry the
+    ANSIBLE-MANAGED marker). Pure filesystem scan of the Director's resource
+    dir — no console call. The UI uses this to badge + lock Ansible-owned
+    resources under the hybrid ownership model.
+    """
+    return {"client": _scan_ansible_managed("client"), "job": _scan_ansible_managed("job")}
 
 
 ### filesets
@@ -896,6 +1491,71 @@ def read_job_status(
         return {"message": "Job with Job ID {jobid} not found".format(jobid=job_id)}
 
 
+# Job states after which there is nothing live to show any more.
+_TERMINAL_JOB_STATES = {"T", "W", "E", "e", "f", "A"}
+
+
+@app.get("/control/jobs/{job_id}/live", tags=["jobcontrol", "control", "jobs"])
+def read_job_live(
+    *,
+    job_id: int = Path(..., title="The ID of the job", ge=1),
+    response: Response,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Live progress of a running job.
+
+    The catalog only gets JobFiles/JobBytes when a job ends, so live numbers
+    come from the file daemon: this runs `status client=<the job's client>` on
+    a raw console (the JSON API doesn't serialize that subcommand) and returns
+    the text. The caller parses the "JobId <id>" block (files, bytes, rate,
+    current file) — same format as Bacula's, so existing parsers apply.
+    For a finished job `running` is false and `status` is empty.
+    """
+    try:
+        found = current_user.jsonDirector.call("llist jobid=%d" % job_id)
+    except Exception as e:
+        response.status_code = 500
+        return {"message": "Could not query job %d: %s" % (job_id, e)}
+    jobs = (found or {}).get("jobs") or []
+    if not jobs:
+        response.status_code = 404
+        return {"message": "Job with Job ID %d not found" % job_id}
+    info = jobs[0]
+    jobstatus = str(info.get("jobstatus", ""))
+    client = str(info.get("client", ""))
+    base = {"jobid": job_id, "jobstatus": jobstatus, "client": client}
+    if jobstatus in _TERMINAL_JOB_STATES:
+        return dict(base, running=False, status="")
+    try:
+        _validate_resource(client, "client name")
+    except ValueError as e:
+        response.status_code = 500
+        return dict(base, running=True, status="", message=str(e))
+
+    raw_console = None
+    try:
+        raw_console = bareos.bsock.DirectorConsole(
+            address=CONFIG_DIRECTOR_ADDRESS,
+            port=CONFIG_DIRECTOR_PORT,
+            dirname=CONFIG_DIRECTOR_NAME,
+            name=current_user.username,
+            password=bareos.bsock.Password(current_user.password),
+        )
+        result = raw_console.call("status client=%s" % client)
+    except Exception as e:
+        # An FD that is unreachable mid-job is a valid answer, not a 5xx.
+        return dict(base, running=True, status="", message=str(e))
+    finally:
+        if raw_console is not None:
+            try:
+                raw_console.close()
+            except Exception:
+                pass
+    text = result.decode("utf-8", "replace") if isinstance(result, bytes) else str(result)
+    return dict(base, running=True, status=text)
+
+
 @app.get("/control/jobs", tags=["jobcontrol", "control", "jobs"])
 def read_all_jobs_status(
     *,
@@ -1143,6 +1803,58 @@ def post_job(
         response=response,
         current_user=current_user,
         componentType="job",
+    )
+
+
+@app.put("/configuration/jobs/{jobs_name}", tags=["jobs", "configuration"])
+def put_job(
+    *,
+    jobs_name: str = Path(..., title="Job (name) to modify"),
+    jobDef: jobUpdate = Body(..., title="Desired job state"),
+    response: Response,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Modify a job resource (partial, merge semantics).
+
+    Same file-based mechanism as the client endpoints (bconsole has no
+    `configure modify`): the fields you send are merged into the resource file
+    at <ResourceDir>/job/<name>.conf and the director is reloaded; omitted
+    directives are preserved. The job must already exist — use
+    POST /configuration/jobs to create. The URL {jobs_name} is authoritative;
+    a `name` in the body must match it (there is no rename).
+    """
+    return _modify_resource(
+        response=response,
+        current_user=current_user,
+        componentType="job",
+        resourceType="Job",
+        name_raw=jobs_name,
+        data=jobDef.dict(),
+        aliases=_JOB_ALIASES,
+    )
+
+
+@app.delete("/configuration/jobs/{jobs_name}", tags=["jobs", "configuration"])
+def delete_job_config(
+    *,
+    jobs_name: str = Path(..., title="Job (name) to delete"),
+    response: Response,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Delete a job resource from the director.
+
+    Removes <ResourceDir>/job/<name>.conf and reloads. If a running/scheduled
+    job or another resource still depends on it the reload reports the error
+    and the delete is rolled back.
+    """
+    return _delete_resource(
+        response=response,
+        current_user=current_user,
+        componentType="job",
+        resourceType="Job",
+        name_raw=jobs_name,
     )
 
 

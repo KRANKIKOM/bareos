@@ -2,6 +2,13 @@
 Name=bareos-dir
 Address=127.0.0.1
 Port=9101
+# Director resource tree; client/job modify/delete edit files here and reload.
+# The API needs write access to it (co-located with the director).
+# ResourceDir=/etc/bareos/bareos-dir.d
+# Shared cluster secret (same value as Ansible's bareos_common_cluster_secret).
+# Enables POST /configuration/clients without a password: it is then derived
+# as sha256(ClusterSecret + hostname + "fd"), matching the bareos_fd role.
+# ClusterSecret=
 
 [JWT]
 # to get a string like this run:

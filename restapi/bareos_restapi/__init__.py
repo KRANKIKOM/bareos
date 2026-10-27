@@ -675,22 +675,15 @@ def read_client_by_name(
     )
 
 
-def _derivation_candidates(name, address):
+def _derivation_candidates(name, address=None):
     """
-    Hostnames a client may derive its password from — only its OWN identity,
-    so a caller can't use the endpoint as an oracle for arbitrary hosts'
-    secrets: the first DNS label of `address` (not for IPs), the client name,
-    and the client name minus a trailing "-fd". First entry = default.
+    Hostnames a client may derive its password from — bound to the client's
+    own NAME only (the address can't steer it), so a caller can't use the
+    endpoint as an oracle for arbitrary hosts: the name minus a trailing "-fd"
+    (legacy convention, default) and the bare name (modern convention, where
+    the client is named like its host). `address` is ignored on purpose.
     """
     out = []
-    addr = (address or "").strip()
-    if addr:
-        import ipaddress
-
-        try:
-            ipaddress.ip_address(addr)
-        except ValueError:
-            out.append(addr.split(".")[0])
     if name.lower().endswith("-fd"):
         out.append(name[:-3])
     out.append(name)

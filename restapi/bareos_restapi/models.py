@@ -668,8 +668,8 @@ class clientCreate(clientResource):
     sha256(ClusterSecret + hostname + "fd"), so API-created clients and
     Ansible-installed FDs agree without anyone typing a password. ``hostname``
     is only an input to that derivation (the FD host's short hostname) and is
-    never written to the resource; it defaults to the first label of
-    ``address`` (or the client name without a trailing "-fd" for IPs).
+    never written to the resource; it is bound to the client's own name: the
+    name without a trailing "-fd" (default) or the bare name.
     """
 
     password: Optional[str] = Field(

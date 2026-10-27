@@ -62,6 +62,15 @@ CONFIG_DIRECTOR_RESOURCE_DIR = config.get(
 # told via /configuration/clients/{name}/fd-config): sha256(secret+host+"fd").
 # Empty = no derivation; POST /configuration/clients then requires a password.
 CONFIG_CLUSTER_SECRET = config.get("Director", "ClusterSecret", fallback="")
+# Consoles allowed to use operations that touch resource files or FD secrets
+# directly (client/job modify+delete, fd-config, password derivation). Those
+# bypass the director's per-console ACLs, so they are restricted to explicitly
+# trusted consoles (comma-separated names). Empty = nobody.
+CONFIG_ADMIN_CONSOLES = {
+    c.strip()
+    for c in config.get("Director", "AdminConsoles", fallback="").split(",")
+    if c.strip()
+}
 
 SECRET_KEY = config.get("JWT", "secret_key")
 ALGORITHM = config.get("JWT", "algorithm")
@@ -666,14 +675,14 @@ def read_client_by_name(
     )
 
 
-def _derivation_hostname(name, address, hostname=None):
+def _derivation_candidates(name, address):
     """
-    Short hostname for password derivation — what Ansible calls
-    ansible_hostname. Explicit `hostname` wins; otherwise the first DNS label of
-    `address`; for an IP address the client name minus a trailing "-fd".
+    Hostnames a client may derive its password from — only its OWN identity,
+    so a caller can't use the endpoint as an oracle for arbitrary hosts'
+    secrets: the first DNS label of `address` (not for IPs), the client name,
+    and the client name minus a trailing "-fd". First entry = default.
     """
-    if hostname:
-        return hostname.strip()
+    out = []
     addr = (address or "").strip()
     if addr:
         import ipaddress
@@ -681,8 +690,29 @@ def _derivation_hostname(name, address, hostname=None):
         try:
             ipaddress.ip_address(addr)
         except ValueError:
-            return addr.split(".")[0]
-    return name[:-3] if name.lower().endswith("-fd") else name
+            out.append(addr.split(".")[0])
+    if name.lower().endswith("-fd"):
+        out.append(name[:-3])
+    out.append(name)
+    return list(dict.fromkeys(out))
+
+
+def _derivation_hostname(name, address, hostname=None):
+    """
+    Short hostname for password derivation — what Ansible calls
+    ansible_hostname. An explicit `hostname` must be one of the client's own
+    candidates (see _derivation_candidates); default is the first candidate.
+    """
+    candidates = _derivation_candidates(name, address)
+    if hostname:
+        h = hostname.strip()
+        if h not in candidates:
+            raise ValueError(
+                "hostname must be one of %s (derived from the client's name/address)"
+                % ", ".join(candidates)
+            )
+        return h
+    return candidates[0]
 
 
 def _derive_fd_password(hostname):
@@ -709,6 +739,15 @@ def post_client(
     """
     data = clientDef.dict()
     hostname = data.pop("hostname", None)
+    try:
+        _validate_resource(str(data.get("name", "")), "client name")
+        for key, value in data.items():
+            if isinstance(value, str):
+                _reject_control_chars(value, key)
+    except ValueError as e:
+        response.status_code = 400
+        return {"message": str(e)}
+
     derived_from = None
     if not data.get("password"):
         if not CONFIG_CLUSTER_SECRET:
@@ -717,8 +756,13 @@ def post_client(
                 "message": "password is required (no ClusterSecret configured "
                 "for password derivation)"
             }
-        derived_from = _derivation_hostname(data["name"], data.get("address"), hostname)
+        # Deriving uses the cluster secret, which bypasses console ACLs.
+        denied = _authorize_resource_op(current_user)
+        if denied:
+            response.status_code = 403
+            return {"message": denied}
         try:
+            derived_from = _derivation_hostname(data["name"], data.get("address"), hostname)
             _validate_resource(derived_from, "hostname")
         except ValueError as e:
             response.status_code = 400
@@ -762,6 +806,10 @@ def read_client_fd_config(
     except ValueError as e:
         response.status_code = 400
         return {"message": str(e)}
+    denied = _authorize_resource_op(current_user, "client", name)
+    if denied:
+        response.status_code = 403
+        return {"message": denied}
     try:
         with open(path, "r", encoding="utf-8") as fh:
             text = fh.read()
@@ -827,6 +875,52 @@ def _resource_file_path(componentType, name):
     return target
 
 
+def _reject_control_chars(value, label="value"):
+    """
+    Refuse control characters in anything that ends up in a resource file or a
+    console command line: a newline would let a value inject extra directives
+    or a second command.
+    """
+    s = str(value)
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in s):
+        raise ValueError("%s must not contain control characters (newline, NUL, …)" % label)
+    return s
+
+
+def _quote_directive_string(value):
+    s = _reject_control_chars(value)
+    return '"%s"' % s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _authorize_resource_op(current_user, componentType=None, name=None):
+    """
+    Gate for operations that read/write resource files or FD secrets directly
+    and therefore bypass the director's console ACLs. The caller's console must
+    be listed in [Director] AdminConsoles, and an existing resource must be
+    visible through the caller's own console (`show` is ACL-filtered).
+    Returns an error message, or None when allowed.
+    """
+    if current_user.username not in CONFIG_ADMIN_CONSOLES:
+        return (
+            "console '%s' may not manage resource files or FD secrets "
+            "(see [Director] AdminConsoles)" % current_user.username
+        )
+    if componentType and name:
+        key = componentType + "s"
+        try:
+            shown = current_user.jsonDirector.call("show %s=%s" % (key, name))
+        except Exception as e:
+            return "could not verify access to %s '%s': %s" % (componentType, name, e)
+        coll = shown.get(key) if isinstance(shown, dict) else None
+        if not isinstance(coll, dict) or name not in coll:
+            return "%s '%s' is not visible to console '%s'" % (
+                componentType,
+                name,
+                current_user.username,
+            )
+    return None
+
+
 def _format_directive_value(value):
     """Render one directive value for a Bareos resource file."""
     # bareosBool is a str-Enum, so test it before the generic str branch.
@@ -837,9 +931,8 @@ def _format_directive_value(value):
     if isinstance(value, (int, float)):
         return str(value)
     if isinstance(value, (list, tuple)):
-        return ", ".join('"%s"' % str(v) for v in value)
-    s = str(value).replace("\\", "\\\\").replace('"', '\\"')
-    return '"%s"' % s
+        return ", ".join(_quote_directive_string(v) for v in value)
+    return _quote_directive_string(value)
 
 
 # Client-resource directive aliases (from core/src/dird/dird_conf.cc,
@@ -930,9 +1023,7 @@ def _reload_after(current_user, response, path, rollback_content, action):
     rollback_content (or delete the file when None) so the on-disk config and
     the director's in-memory config never diverge. Returns the reload payload.
     """
-    try:
-        result = current_user.jsonDirector.call("reload")
-    except Exception as e:
+    def rollback(reason):
         try:
             if rollback_content is None:
                 if os.path.isfile(path):
@@ -944,11 +1035,23 @@ def _reload_after(current_user, response, path, rollback_content, action):
         response.status_code = 500
         return {
             "message": "%s but director reload failed (rolled back). Message: '%s'"
-            % (action, e)
+            % (action, reason)
         }
-    if isinstance(result, dict) and "reload" in result:
-        return result["reload"]
-    return result
+
+    try:
+        result = current_user.jsonDirector.call("reload")
+    except Exception as e:
+        return rollback(e)
+    payload = result.get("reload", result) if isinstance(result, dict) else result
+    if isinstance(result, dict) and "error" in result:
+        return rollback(result["error"])
+    if isinstance(payload, dict) and str(payload.get("success", "")).lower() in (
+        "false",
+        "no",
+        "0",
+    ):
+        return rollback(payload)
+    return payload
 
 
 def _modify_resource(
@@ -982,6 +1085,11 @@ def _modify_resource(
             % (resourceType, name)
         }
 
+    denied = _authorize_resource_op(current_user, componentType, name)
+    if denied:
+        response.status_code = 403
+        return {"detail": denied}
+
     body_name = data.get("name")
     if body_name is not None:
         try:
@@ -998,10 +1106,14 @@ def _modify_resource(
         current = fh.read()
 
     overrides = {}
-    for key, value in data.items():
-        if key == "name" or value is None:
-            continue
-        overrides[_norm_directive_key(key, aliases)] = _format_directive_value(value)
+    try:
+        for key, value in data.items():
+            if key == "name" or value is None:
+                continue
+            overrides[_norm_directive_key(key, aliases)] = _format_directive_value(value)
+    except ValueError as e:
+        response.status_code = 400
+        return {"detail": str(e)}
 
     block, keys_present = _merge_resource_block(
         resourceType, current, overrides, _format_directive_value(name), aliases
@@ -1043,6 +1155,11 @@ def _delete_resource(*, response, current_user, componentType, resourceType, nam
     if not os.path.isfile(path):
         response.status_code = 404
         return {"detail": "No %s resource file for '%s'." % (componentType, name)}
+
+    denied = _authorize_resource_op(current_user, componentType, name)
+    if denied:
+        response.status_code = 403
+        return {"detail": denied}
 
     try:
         with open(path, "r") as fh:

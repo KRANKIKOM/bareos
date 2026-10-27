@@ -9,6 +9,10 @@ Port=9101
 # Enables POST /configuration/clients without a password: it is then derived
 # as sha256(ClusterSecret + hostname + "fd"), matching the bareos_fd role.
 # ClusterSecret=
+# Consoles allowed to modify/delete client+job resource files, read FD secrets
+# (fd-config) and use password derivation. These bypass per-console ACLs, so
+# list only trusted, full-access consoles (comma-separated). Empty = nobody.
+# AdminConsoles=restapi
 
 [JWT]
 # to get a string like this run:

@@ -1489,7 +1489,7 @@ def rerun_Job_by_jobid(
         return {"jobid": int(result["run"]["jobid"])}
     else:
         response.status_code = 500
-        return {"message": "Job '%s' triggered but no jobId returned" % jobCommand}
+        return {"message": "'%s' triggered but no jobId returned" % rerunCommand}
 
 
 @app.post("/control/jobs/rerun", tags=["jobcontrol", "control", "jobs"])
@@ -2206,6 +2206,17 @@ def update_volume(
     TODO: verify, that parameter are quoted correct
     """
     responseDict = {}
+    try:
+        volume_name = _validate_resource(volume_name, "volume name")
+        # Every value ends up as `key=value` on one console line: no field may
+        # carry whitespace, '=', ';' or control chars (would add arguments).
+        for key, value in volumeProps.dict().items():
+            if value is not None and not isinstance(value, (bool, int, float)):
+                if not re.fullmatch(r"[A-Za-z0-9._:+-]+", str(value)):
+                    raise ValueError("%s contains characters that are not allowed" % key)
+    except ValueError as e:
+        response.status_code = 400
+        return {"message": str(e)}
     updateCommand = "update volume=%s" % volume_name
     updateCommand += parseCommandOptions(volumeProps.dict())
     # print(updateCommand)
@@ -2356,6 +2367,11 @@ def delete_volume(
     Delete a volume from catalog using the _delete volume_ command.
     """
     responseDict = {}
+    try:
+        volume_name = _validate_resource(volume_name, "volume name")
+    except ValueError as e:
+        response.status_code = 400
+        return {"message": str(e)}
     deleteCommand = "delete volume=%s yes" % volume_name
     try:
         responseDict = current_user.jsonDirector.call(deleteCommand)
@@ -2368,6 +2384,52 @@ def delete_volume(
     # Director delivers empty response
     response.status_code = 204
     return responseDict
+
+
+@app.post("/control/volumes/{volume_name}/purge", tags=["volumes", "control"])
+def purge_volume(
+    *,
+    response: Response,
+    current_user: User = Depends(get_current_user),
+    volume_name: str = Path(..., title="Volume to purge", example="host-incr-0007"),
+):
+    """
+    Purge a volume (`purge volume=<name> yes`): drops every job/file record that
+    lives on it from the catalog and sets VolStatus=Purged. The data on the
+    medium stays until it is truncated or recycled.
+    """
+    return _volume_command(response, current_user, volume_name, "purge volume=%s yes")
+
+
+@app.post("/control/volumes/{volume_name}/truncate", tags=["volumes", "control"])
+def truncate_volume(
+    *,
+    response: Response,
+    current_user: User = Depends(get_current_user),
+    volume_name: str = Path(..., title="Purged volume to truncate", example="host-incr-0007"),
+):
+    """
+    Truncate a purged volume (`truncate volstatus=Purged volume=<name> yes`): the
+    storage daemon cuts the volume file back to its label, freeing the space
+    while the volume stays in the catalog. Only volumes already Purged qualify.
+    """
+    return _volume_command(
+        response, current_user, volume_name, "truncate volstatus=Purged volume=%s yes"
+    )
+
+
+def _volume_command(response, current_user, volume_name, template):
+    try:
+        name = _validate_resource(volume_name, "volume name")
+    except ValueError as e:
+        response.status_code = 400
+        return {"message": str(e)}
+    command = template % name
+    try:
+        return current_user.jsonDirector.call(command)
+    except Exception as e:
+        response.status_code = 500
+        return {"message": "Could not run '%s' on director %s. Message: '%s'" % (command, CONFIG_DIRECTOR_NAME, e)}
 
 
 ### Pools

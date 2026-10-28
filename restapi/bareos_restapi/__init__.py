@@ -37,7 +37,10 @@ from pydantic import BaseModel
 from typing import Optional
 import yaml
 
+import threading
+
 import bareos.bsock
+import bareos.exceptions
 import bareos.util
 from bareos_restapi.models import *
 
@@ -97,6 +100,78 @@ app = FastAPI(
 )
 
 
+# Read-only console commands: safe to repeat after a reconnect. Anything else
+# (run, configure add, delete, label, …) may already have reached the director
+# before the socket died, so it is never replayed — the caller gets the error
+# and the next request runs on a fresh connection.
+_READONLY_COMMANDS = (
+    "list", "llist", "show", "status", "version", ".api", ".bvfs_", ".jobs",
+    ".clients", ".filesets", ".pools", ".storages", ".schedule", ".defaults",
+)
+
+
+class DirectorSession(object):
+    """
+    One director console connection per API user, shared by every request of
+    that user. FastAPI runs (sync) endpoints concurrently in a threadpool, and
+    several clients may use the same login (e.g. a web app and its worker):
+    unserialized calls interleave on the socket, the reads get out of step and
+    python-bareos reports "Assuming the connection is lost". A dead socket (e.g.
+    after a director restart) was also never rebuilt — every call failed until
+    the next /token.
+
+    So: serialize calls per user, and on a connection error reconnect; replay
+    the command once only if it is read-only.
+    """
+
+    def __init__(self, username, password):
+        self._username = username
+        self._password = password
+        self._lock = threading.Lock()
+        self._conn = None
+        self._connect()
+
+    def _connect(self):
+        self._conn = bareos.bsock.DirectorConsoleJson(
+            address=CONFIG_DIRECTOR_ADDRESS,
+            port=CONFIG_DIRECTOR_PORT,
+            dirname=CONFIG_DIRECTOR_NAME,
+            name=self._username,
+            password=bareos.bsock.Password(self._password),
+        )
+
+    def _close(self):
+        try:
+            if self._conn is not None:
+                self._conn.close()
+        except Exception:
+            pass
+        self._conn = None
+
+    @staticmethod
+    def _connection_error(e):
+        # Command errors come back as JsonRpc*; everything else from bsock (and
+        # plain socket errors) means the transport is gone.
+        if isinstance(e, bareos.exceptions.JsonRpcErrorReceivedException):
+            return False
+        return isinstance(e, (bareos.exceptions.Error, OSError))
+
+    def call(self, command):
+        with self._lock:
+            if self._conn is None:
+                self._connect()
+            try:
+                return self._conn.call(command)
+            except Exception as e:
+                if not self._connection_error(e):
+                    raise
+                self._close()
+                self._connect()
+                if str(command).lstrip().startswith(_READONLY_COMMANDS):
+                    return self._conn.call(command)
+                raise
+
+
 class UserObject(object):
     def __init__(self, username, password):
         # self.id = id
@@ -135,15 +210,18 @@ def get_user(username: str):
 
 
 def authenticate_user(username: str, password: str):
+    # Re-login with the same credentials keeps the existing session: replacing
+    # it would orphan a socket other in-flight requests are still using.
+    existing = users_db.get(username)
+    if (
+        existing is not None
+        and existing.password == password
+        and isinstance(existing.jsonDirector, DirectorSession)
+    ):
+        return existing
     jsonDirector = None
     try:
-        jsonDirector = bareos.bsock.DirectorConsoleJson(
-            address=CONFIG_DIRECTOR_ADDRESS,
-            port=CONFIG_DIRECTOR_PORT,
-            dirname=CONFIG_DIRECTOR_NAME,
-            name=username,
-            password=bareos.bsock.Password(password),
-        )
+        jsonDirector = DirectorSession(username, password)
     except Exception as e:
         print(
             "Could not authorize %s at director %s. %s"

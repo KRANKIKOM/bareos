@@ -37,6 +37,7 @@ from pydantic import BaseModel
 from typing import Optional
 import yaml
 
+import hmac
 import threading
 
 import bareos.bsock
@@ -210,26 +211,35 @@ def get_user(username: str):
 
 
 def authenticate_user(username: str, password: str):
-    # Re-login with the same credentials keeps the existing session: replacing
-    # it would orphan a socket other in-flight requests are still using.
-    existing = users_db.get(username)
-    if (
-        existing is not None
-        and existing.password == password
-        and isinstance(existing.jsonDirector, DirectorSession)
-    ):
-        return existing
-    jsonDirector = None
+    # Always authenticate against the director: a cached session must never
+    # vouch for credentials the director may since have changed or revoked.
     try:
-        jsonDirector = DirectorSession(username, password)
+        session = DirectorSession(username, password)
     except Exception as e:
         print(
             "Could not authorize %s at director %s. %s"
             % (username, CONFIG_DIRECTOR_NAME, e)
         )
+        # Only the cached password failing means the cached session is stale. A
+        # wrong password from someone else must not evict a working session.
+        stale = users_db.get(username)
+        if stale is not None and hmac.compare_digest(stale.password, password):
+            users_db.pop(username, None)
+            if isinstance(stale.jsonDirector, DirectorSession):
+                stale.jsonDirector._close()
         return False
+    # Same verified credentials → keep the existing session (in-flight requests
+    # use it) and drop the probe; otherwise the new session replaces it.
+    existing = users_db.get(username)
+    if (
+        existing is not None
+        and isinstance(existing.jsonDirector, DirectorSession)
+        and hmac.compare_digest(existing.password, password)
+    ):
+        session._close()
+        return existing
     user = UserObject(username, password)
-    user.jsonDirector = jsonDirector
+    user.jsonDirector = session
     user.username = username
     users_db[username] = user
     return user

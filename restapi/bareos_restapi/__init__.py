@@ -1691,6 +1691,11 @@ def read_job_status(
 
 # Job states after which there is nothing live to show any more.
 _TERMINAL_JOB_STATES = {"T", "W", "E", "e", "f", "A"}
+# Jobs whose data never touches a file daemon: Migrate (g), Copy (c),
+# Consolidate (O) and every VirtualFull move data SD-side only. Their live
+# numbers are in `status storage=`, not `status client=` (the client is a
+# placeholder like bareos-fd).
+_SD_ONLY_JOB_TYPES = {"g", "c", "O"}
 
 
 @app.get("/control/jobs/{job_id}/live", tags=["jobcontrol", "control", "jobs"])
@@ -1725,6 +1730,15 @@ def read_job_live(
     base = {"jobid": job_id, "jobstatus": jobstatus, "client": client}
     if jobstatus in _TERMINAL_JOB_STATES:
         return dict(base, running=False, status="")
+    if str(info.get("type", "")) in _SD_ONLY_JOB_TYPES or str(info.get("level", "")) == "V":
+        # A Migrate/Copy job reads under its own JobId on the source SD; the
+        # target SD writes a new backup job into this job's pool (poolname =
+        # the Next Pool). Its JobId lands in priorjobid only at the end (lab,
+        # Bareos 25.1), so the caller finds the writer by that pool.
+        pool = str(info.get("poolname", "") or "")
+        if pool:
+            base = dict(base, writepool=pool)
+        return _job_live_from_storages(current_user, base)
     try:
         _validate_resource(client, "client name")
     except ValueError as e:
@@ -1752,6 +1766,50 @@ def read_job_live(
                 pass
     text = result.decode("utf-8", "replace") if isinstance(result, bytes) else str(result)
     return dict(base, running=True, status=text)
+
+
+def _job_live_from_storages(current_user, base):
+    """`status storage=` of every storage, joined: the job shows up as a
+    "JobId=<id> … Type=Migrate" block on the SD that reads it, the new job
+    as a "Writing:" block into writepool on the target SD.
+    Each section starts with "== Storage <name> ==" so the caller can tell
+    which SD it came from."""
+    try:
+        found = current_user.jsonDirector.call(".storages")
+        names = [str(x.get("name", "")) for x in (found or {}).get("storages", [])]
+    except Exception as e:
+        return dict(base, running=True, status="", source="storage", message=str(e))
+    raw_console = None
+    parts = []
+    try:
+        raw_console = bareos.bsock.DirectorConsole(
+            address=CONFIG_DIRECTOR_ADDRESS,
+            port=CONFIG_DIRECTOR_PORT,
+            dirname=CONFIG_DIRECTOR_NAME,
+            name=current_user.username,
+            password=bareos.bsock.Password(current_user.password),
+        )
+        for name in names:
+            try:
+                _validate_resource(name, "storage name")
+            except ValueError:
+                continue
+            try:
+                result = raw_console.call("status storage=%s" % name)
+            except Exception as e:
+                parts.append("== Storage %s ==\n(unreachable: %s)\n" % (name, e))
+                continue
+            text = result.decode("utf-8", "replace") if isinstance(result, bytes) else str(result)
+            parts.append("== Storage %s ==\n%s" % (name, text))
+    except Exception as e:
+        return dict(base, running=True, status="\n".join(parts), source="storage", message=str(e))
+    finally:
+        if raw_console is not None:
+            try:
+                raw_console.close()
+            except Exception:
+                pass
+    return dict(base, running=True, status="\n".join(parts), source="storage")
 
 
 @app.get("/control/jobs", tags=["jobcontrol", "control", "jobs"])

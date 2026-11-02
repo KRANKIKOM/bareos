@@ -2476,6 +2476,21 @@ def truncate_volume(
     )
 
 
+@app.get("/control/volumes/{volume_name}/jobs", tags=["volumes", "control"])
+def read_volume_jobs(
+    *,
+    response: Response,
+    current_user: User = Depends(get_current_user),
+    volume_name: str = Path(..., title="Volume", example="host-incr-0007"),
+):
+    """
+    The jobs that wrote to a volume (`list jobs volume=<name>`, the JobMedia
+    join the catalog API does not offer). Dracula checks with it that the old
+    volumes of an SD move hold nothing but migrated originals before deleting.
+    """
+    return _volume_command(response, current_user, volume_name, "list jobs volume=%s")
+
+
 def _volume_command(response, current_user, volume_name, template):
     try:
         name = _validate_resource(volume_name, "volume name")

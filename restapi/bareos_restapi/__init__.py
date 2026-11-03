@@ -2569,8 +2569,8 @@ def read_restore_checks(
 # Per target (bareos_config_offsite_targets) Ansible writes into
 # <ResourceDir>/offsite/:
 #   <target>.sql      the copy job's selection SQL with the token @@CLIENTS@@,
-#                     header lines "-- mode: exclude|include", "-- job: <copy
-#                     job>", "-- pool: <target pool>" (Ansible-owned)
+#                     header lines "-- key: value" (mode exclude|include, job,
+#                     pool, source = the storage it reads from …; Ansible-owned)
 #   <target>.clients  one client name per line (owned by this endpoint)
 #   <target>.pattern  the quoted Selection Pattern the job @includes, = sql with
 #                     the client list filled in (written by both)
@@ -2586,7 +2586,7 @@ def _offsite_dir():
 
 def _offsite_read_target(target):
     """(meta, sql, clients) of a target, or None when it has no .sql file.
-    meta = the "-- key: value" header lines (mode, job, pool)."""
+    meta = the "-- key: value" header lines (mode, job, pool, source …)."""
     base = os.path.join(_offsite_dir(), target)
     try:
         with open(base + ".sql", "r", encoding="utf-8") as fh:
@@ -2596,7 +2596,7 @@ def _offsite_read_target(target):
     meta = {"mode": "exclude", "job": None, "pool": None}
     body = []
     for line in sql_lines:
-        m = re.match(r"^--\s*(mode|job|pool):\s*([A-Za-z0-9._-]+)\s*$", line.strip())
+        m = re.match(r"^--\s*([a-z_]{1,32}):\s*([A-Za-z0-9._-]{1,128})\s*$", line.strip())
         if m:
             meta[m.group(1)] = m.group(2)
         elif not line.strip().startswith("--"):

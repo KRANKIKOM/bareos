@@ -26,6 +26,7 @@
 
 import configparser
 import hashlib
+import json
 from datetime import datetime, timedelta
 from fastapi import Depends, FastAPI, HTTPException, status, Response, Path, Body, Query
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -75,6 +76,11 @@ CONFIG_ADMIN_CONSOLES = {
     for c in config.get("Director", "AdminConsoles", fallback="").split(",")
     if c.strip()
 }
+
+# JSONL history of the daily restore check (bareos_dr's bareos-canary-check,
+# one record per check and per run), read-only for GET /control/restore-checks.
+# Empty = endpoint disabled.
+CONFIG_RESTORE_CHECKS_FILE = config.get("Director", "RestoreChecksFile", fallback="")
 
 SECRET_KEY = config.get("JWT", "secret_key")
 ALGORITHM = config.get("JWT", "algorithm")
@@ -2489,6 +2495,73 @@ def read_volume_jobs(
     volumes of an SD move hold nothing but migrated originals before deleting.
     """
     return _volume_command(response, current_user, volume_name, "list jobs volume=%s")
+
+
+@app.get("/control/restore-checks", tags=["control"])
+def read_restore_checks(
+    *,
+    response: Response,
+    current_user: User = Depends(get_current_user),
+    client: Optional[str] = Query(None, title="Only checks of this client"),
+    jobid: Optional[int] = Query(
+        None, gt=0, title="Only checks of this backup job or by this restore job"
+    ),
+    since: Optional[str] = Query(None, title="Only records at or after this ISO timestamp"),
+    limit: int = Query(200, ge=1, le=5000, title="Newest N checks"),
+):
+    """
+    History of the daily restore check (bareos-canary-check on the director
+    box): which job of which client was restored, how, and with what result.
+    Newest first. `runs` carries the last runs' summaries when no client/jobid
+    filter is set. The file lives outside the catalog, so like the resource
+    file operations this is limited to AdminConsoles.
+    """
+    denied = _authorize_resource_op(current_user)
+    if denied:
+        response.status_code = 403
+        return {"message": denied}
+    if not CONFIG_RESTORE_CHECKS_FILE:
+        response.status_code = 404
+        return {"message": "No RestoreChecksFile configured"}
+    try:
+        if client is not None:
+            _validate_resource(client, "client name")
+        if since is not None and not re.fullmatch(r"[0-9T:+.\- ]{10,40}", since):
+            raise ValueError("since must be an ISO timestamp")
+    except ValueError as e:
+        response.status_code = 400
+        return {"message": str(e)}
+    try:
+        with open(CONFIG_RESTORE_CHECKS_FILE, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except FileNotFoundError:
+        # No run yet: an empty history, not an error.
+        return {"checks": [], "runs": []}
+    except OSError as e:
+        response.status_code = 500
+        return {"message": "Could not read %s: %s" % (CONFIG_RESTORE_CHECKS_FILE, e)}
+
+    checks, runs = [], []
+    for line in reversed(lines):
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        if since and str(rec.get("checked", "")) < since:
+            continue
+        if rec.get("type") == "run":
+            if client is None and jobid is None and len(runs) < 30:
+                runs.append(rec)
+            continue
+        if client is not None and rec.get("client") != client:
+            continue
+        if jobid is not None and jobid not in (rec.get("id"), rec.get("restore_jobid")):
+            continue
+        if len(checks) < limit:
+            checks.append(rec)
+    return {"checks": checks, "runs": runs}
 
 
 def _volume_command(response, current_user, volume_name, template):

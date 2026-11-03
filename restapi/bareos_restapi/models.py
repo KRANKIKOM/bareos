@@ -426,6 +426,14 @@ class jobControl(BaseModel):
     verifyjob: Optional[str] = Field(None)
     verifylist: Optional[str] = Field(None)
     migrationjob: Optional[str] = Field(None)
+    # Copy/Migrate: copy exactly this job instead of the job's Selection Pattern.
+    jobid: Optional[int] = Field(None, gt=0, title="Copy/Migrate only this JobId")
+
+
+class offsiteTargetClients(BaseModel):
+    """Client list of an offsite target (meaning set by its SQL: excluded or included clients)."""
+
+    clients: List[str] = Field(..., title="Client names", max_length=2000)
 
 
 class restoreBvfsControl(BaseModel):

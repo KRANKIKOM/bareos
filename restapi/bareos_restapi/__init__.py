@@ -27,6 +27,7 @@
 import configparser
 import hashlib
 import json
+import re
 from datetime import datetime, timedelta
 from fastapi import Depends, FastAPI, HTTPException, status, Response, Path, Body, Query
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -2562,6 +2563,149 @@ def read_restore_checks(
         if len(checks) < limit:
             checks.append(rec)
     return {"checks": checks, "runs": runs}
+
+
+# ── Offsite targets: which clients a copy job takes ───────────────────────
+# Per target (bareos_config_offsite_targets) Ansible writes into
+# <ResourceDir>/offsite/:
+#   <target>.sql      the copy job's selection SQL with the token @@CLIENTS@@,
+#                     first line "-- mode: exclude|include" (Ansible-owned)
+#   <target>.clients  one client name per line (owned by this endpoint)
+#   <target>.pattern  the quoted Selection Pattern the job @includes, = sql with
+#                     the client list filled in (written by both)
+# Bareos cannot splice an @include into the middle of a quoted string, hence the
+# generated whole-pattern file.
+_RE_OFFSITE_TARGET = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+_OFFSITE_PLACEHOLDER = "@@CLIENTS@@"
+
+
+def _offsite_dir():
+    return os.path.join(CONFIG_DIRECTOR_RESOURCE_DIR, "offsite")
+
+
+def _offsite_read_target(target):
+    """(mode, sql, clients) of a target, or None when it has no .sql file."""
+    base = os.path.join(_offsite_dir(), target)
+    try:
+        with open(base + ".sql", "r", encoding="utf-8") as fh:
+            sql_lines = fh.read().splitlines()
+    except FileNotFoundError:
+        return None
+    mode = "exclude"
+    body = []
+    for line in sql_lines:
+        m = re.match(r"^--\s*mode:\s*(exclude|include)\s*$", line.strip())
+        if m:
+            mode = m.group(1)
+        elif not line.strip().startswith("--"):
+            body.append(line.strip())
+    clients = []
+    try:
+        with open(base + ".clients", "r", encoding="utf-8") as fh:
+            clients = [c.strip() for c in fh if c.strip() and not c.startswith("#")]
+    except FileNotFoundError:
+        pass
+    return mode, " ".join(b for b in body if b), clients
+
+
+def _offsite_pattern(sql, clients):
+    # '__none__' keeps the IN () list valid when empty; names are [A-Za-z0-9._-].
+    quoted = ",".join("'%s'" % c for c in ["__none__"] + clients)
+    return '"%s"\n' % sql.replace(_OFFSITE_PLACEHOLDER, quoted)
+
+
+@app.get("/control/offsite-targets", tags=["control"])
+def read_offsite_targets(
+    *,
+    response: Response,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Offsite copy targets and their client lists. mode "exclude": the target
+    copies every client except the listed ones; "include": only the listed ones.
+    """
+    denied = _authorize_resource_op(current_user)
+    if denied:
+        response.status_code = 403
+        return {"message": denied}
+    targets = []
+    try:
+        names = sorted(os.listdir(_offsite_dir()))
+    except FileNotFoundError:
+        names = []
+    for f in names:
+        if not f.endswith(".sql") or not _RE_OFFSITE_TARGET.match(f[:-4]):
+            continue
+        read = _offsite_read_target(f[:-4])
+        if read:
+            targets.append({"target": f[:-4], "mode": read[0], "clients": read[2]})
+    return {"targets": targets}
+
+
+@app.put("/control/offsite-targets/{target}", tags=["control"])
+def put_offsite_target(
+    *,
+    response: Response,
+    current_user: User = Depends(get_current_user),
+    target: str = Path(..., title="Offsite target name"),
+    body: offsiteTargetClients = Body(..., embed=False),
+):
+    """
+    Replace the client list of an offsite target and reload the director. The
+    target must exist (Ansible creates its .sql); a failed reload restores the
+    previous files.
+    """
+    denied = _authorize_resource_op(current_user)
+    if denied:
+        response.status_code = 403
+        return {"message": denied}
+    if not _RE_OFFSITE_TARGET.match(target):
+        response.status_code = 400
+        return {"message": "target must match [a-z0-9-]{1,32}"}
+    read = _offsite_read_target(target)
+    if read is None:
+        response.status_code = 404
+        return {"message": "Unknown offsite target '%s'" % target}
+    mode, sql, _old = read
+    if _OFFSITE_PLACEHOLDER not in sql:
+        response.status_code = 500
+        return {"message": "%s.sql has no %s placeholder" % (target, _OFFSITE_PLACEHOLDER)}
+    try:
+        clients = sorted({_validate_resource(c, "client name") for c in body.clients})
+    except ValueError as e:
+        response.status_code = 400
+        return {"message": str(e)}
+
+    base = os.path.join(_offsite_dir(), target)
+    backups = {}
+    for ext in (".clients", ".pattern"):
+        try:
+            with open(base + ext, "r", encoding="utf-8") as fh:
+                backups[ext] = fh.read()
+        except FileNotFoundError:
+            backups[ext] = None
+    try:
+        _write_resource_file(base + ".clients", "".join(c + "\n" for c in clients))
+        _write_resource_file(base + ".pattern", _offsite_pattern(sql, clients))
+    except OSError as e:
+        response.status_code = 500
+        return {"message": "Could not write offsite target '%s': %s" % (target, e)}
+
+    # _reload_after rolls back one file; restore the other one ourselves.
+    reload_result = _reload_after(
+        current_user, response, base + ".pattern", backups[".pattern"],
+        "Updated offsite target '%s'" % target,
+    )
+    if response.status_code is not None and response.status_code >= 400:
+        try:
+            if backups[".clients"] is None:
+                os.remove(base + ".clients")
+            else:
+                _write_resource_file(base + ".clients", backups[".clients"])
+        except OSError:
+            pass
+        return reload_result
+    return {"target": target, "mode": mode, "clients": clients, "reload": reload_result}
 
 
 def _volume_command(response, current_user, volume_name, template):

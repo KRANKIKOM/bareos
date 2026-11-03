@@ -2569,7 +2569,8 @@ def read_restore_checks(
 # Per target (bareos_config_offsite_targets) Ansible writes into
 # <ResourceDir>/offsite/:
 #   <target>.sql      the copy job's selection SQL with the token @@CLIENTS@@,
-#                     first line "-- mode: exclude|include" (Ansible-owned)
+#                     header lines "-- mode: exclude|include", "-- job: <copy
+#                     job>", "-- pool: <target pool>" (Ansible-owned)
 #   <target>.clients  one client name per line (owned by this endpoint)
 #   <target>.pattern  the quoted Selection Pattern the job @includes, = sql with
 #                     the client list filled in (written by both)
@@ -2584,28 +2585,31 @@ def _offsite_dir():
 
 
 def _offsite_read_target(target):
-    """(mode, sql, clients) of a target, or None when it has no .sql file."""
+    """(meta, sql, clients) of a target, or None when it has no .sql file.
+    meta = the "-- key: value" header lines (mode, job, pool)."""
     base = os.path.join(_offsite_dir(), target)
     try:
         with open(base + ".sql", "r", encoding="utf-8") as fh:
             sql_lines = fh.read().splitlines()
     except FileNotFoundError:
         return None
-    mode = "exclude"
+    meta = {"mode": "exclude", "job": None, "pool": None}
     body = []
     for line in sql_lines:
-        m = re.match(r"^--\s*mode:\s*(exclude|include)\s*$", line.strip())
+        m = re.match(r"^--\s*(mode|job|pool):\s*([A-Za-z0-9._-]+)\s*$", line.strip())
         if m:
-            mode = m.group(1)
+            meta[m.group(1)] = m.group(2)
         elif not line.strip().startswith("--"):
             body.append(line.strip())
+    if meta["mode"] not in ("exclude", "include"):
+        meta["mode"] = "exclude"
     clients = []
     try:
         with open(base + ".clients", "r", encoding="utf-8") as fh:
             clients = [c.strip() for c in fh if c.strip() and not c.startswith("#")]
     except FileNotFoundError:
         pass
-    return mode, " ".join(b for b in body if b), clients
+    return meta, " ".join(b for b in body if b), clients
 
 
 def _offsite_pattern(sql, clients):
@@ -2638,7 +2642,7 @@ def read_offsite_targets(
             continue
         read = _offsite_read_target(f[:-4])
         if read:
-            targets.append({"target": f[:-4], "mode": read[0], "clients": read[2]})
+            targets.append(dict(read[0], target=f[:-4], clients=read[2]))
     return {"targets": targets}
 
 
@@ -2666,7 +2670,7 @@ def put_offsite_target(
     if read is None:
         response.status_code = 404
         return {"message": "Unknown offsite target '%s'" % target}
-    mode, sql, _old = read
+    meta, sql, _old = read
     if _OFFSITE_PLACEHOLDER not in sql:
         response.status_code = 500
         return {"message": "%s.sql has no %s placeholder" % (target, _OFFSITE_PLACEHOLDER)}
@@ -2705,7 +2709,7 @@ def put_offsite_target(
         except OSError:
             pass
         return reload_result
-    return {"target": target, "mode": mode, "clients": clients, "reload": reload_result}
+    return dict(meta, target=target, clients=clients, reload=reload_result)
 
 
 def _volume_command(response, current_user, volume_name, template):

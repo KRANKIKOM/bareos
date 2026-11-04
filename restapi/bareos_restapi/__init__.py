@@ -321,15 +321,16 @@ def authenticate_user(username: str, password: str):
             "Could not authorize %s at director %s. %s"
             % (username, CONFIG_DIRECTOR_NAME, e)
         )
-        # Only the director REJECTING the cached password means the cached
-        # session is stale. A wrong password from someone else, or a network
-        # problem, must not evict a working session.
+        # Fail closed: when the CACHED password no longer logs in — whatever the
+        # error (a revoked console may just drop the connection) — the cached
+        # session is stale and goes. A wrong password from someone else must
+        # not evict a working session; only the local handshake queue
+        # (HandshakeBusy, re-raised above) is not a verdict.
         stale = None
-        if isinstance(e, bareos.exceptions.AuthenticationError):
-            with _USERS_LOCK:
-                cached = users_db.get(username)
-                if cached is not None and hmac.compare_digest(cached.password, password):
-                    stale = users_db.pop(username)
+        with _USERS_LOCK:
+            cached = users_db.get(username)
+            if cached is not None and hmac.compare_digest(cached.password, password):
+                stale = users_db.pop(username)
         if stale is not None and isinstance(stale.jsonDirector, DirectorSession):
             stale.jsonDirector._close()
         return False

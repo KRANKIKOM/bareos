@@ -131,6 +131,9 @@ _READONLY_COMMANDS = (
 )
 
 
+_CONNECT_LOCK = threading.Lock()
+
+
 class _DirectorConnection(object):
     """
     One director console connection, used by one request at a time (the
@@ -150,13 +153,17 @@ class _DirectorConnection(object):
         self._connect()
 
     def _connect(self):
-        self._conn = bareos.bsock.DirectorConsoleJson(
-            address=CONFIG_DIRECTOR_ADDRESS,
-            port=CONFIG_DIRECTOR_PORT,
-            dirname=CONFIG_DIRECTOR_NAME,
-            name=self._username,
-            password=bareos.bsock.Password(self._password),
-        )
+        # Handshakes one at a time, process-wide: concurrent TLS-PSK session
+        # setups raced ("Could not read version from director"). Calls on
+        # established connections stay parallel.
+        with _CONNECT_LOCK:
+            self._conn = bareos.bsock.DirectorConsoleJson(
+                address=CONFIG_DIRECTOR_ADDRESS,
+                port=CONFIG_DIRECTOR_PORT,
+                dirname=CONFIG_DIRECTOR_NAME,
+                name=self._username,
+                password=bareos.bsock.Password(self._password),
+            )
 
     def _close(self):
         try:

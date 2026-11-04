@@ -38,6 +38,12 @@ Address=127.0.0.1
 Port=9101
 ```
 
+Optional: `PoolSize=4` (or env `RESTAPI_DIRECTOR_POOL_SIZE`) — director console
+connections per API user. Concurrent requests of one user run in parallel on
+separate connections (opened only while needed, never more than this); 1 =
+every call of a user is serialized on one connection. Keep it well below the
+director's `MaximumConsoleConnections` (default 20).
+
 Note: you will need a *named console* (user/password) to acces the Bareos director using this API. Read more about Consoles here:
 https://docs.bareos.org/Configuration/Director.html#console-resource
 

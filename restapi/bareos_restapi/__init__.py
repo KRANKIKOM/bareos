@@ -40,6 +40,7 @@ from typing import Optional
 import yaml
 
 import hmac
+import queue
 import threading
 
 import bareos.bsock
@@ -68,6 +69,18 @@ CONFIG_DIRECTOR_RESOURCE_DIR = config.get(
 # told via /configuration/clients/{name}/fd-config): sha256(secret+host+"fd").
 # Empty = no derivation; POST /configuration/clients then requires a password.
 CONFIG_CLUSTER_SECRET = config.get("Director", "ClusterSecret", fallback="")
+# Director console connections per API user (DirectorSession). Requests of one
+# user (e.g. a dashboard rendering a page) then run in parallel instead of
+# queueing on one socket. Opened lazily, only while that many requests are in
+# flight; keep well below the director's MaximumConsoleConnections (default
+# 20). Env RESTAPI_DIRECTOR_POOL_SIZE overrides api.ini; 1 = old behaviour.
+CONFIG_DIRECTOR_POOL_SIZE = max(
+    1,
+    int(
+        os.environ.get("RESTAPI_DIRECTOR_POOL_SIZE")
+        or config.getint("Director", "PoolSize", fallback=4)
+    ),
+)
 # Consoles allowed to use operations that touch resource files or FD secrets
 # directly (client/job modify+delete, fd-config, password derivation). Those
 # bypass the director's per-console ACLs, so they are restricted to explicitly
@@ -118,24 +131,21 @@ _READONLY_COMMANDS = (
 )
 
 
-class DirectorSession(object):
+class _DirectorConnection(object):
     """
-    One director console connection per API user, shared by every request of
-    that user. FastAPI runs (sync) endpoints concurrently in a threadpool, and
-    several clients may use the same login (e.g. a web app and its worker):
-    unserialized calls interleave on the socket, the reads get out of step and
-    python-bareos reports "Assuming the connection is lost". A dead socket (e.g.
-    after a director restart) was also never rebuilt — every call failed until
-    the next /token.
+    One director console connection, used by one request at a time (the
+    owning DirectorSession hands it out exclusively). A single socket must not
+    be shared between threads: unserialized calls interleave, the reads get out
+    of step and python-bareos reports "Assuming the connection is lost". A dead
+    socket (e.g. after a director restart) is rebuilt on the next call.
 
-    So: serialize calls per user, and on a connection error reconnect; replay
-    the command once only if it is read-only.
+    On a connection error: reconnect, and replay the command once only if it
+    is read-only.
     """
 
     def __init__(self, username, password):
         self._username = username
         self._password = password
-        self._lock = threading.Lock()
         self._conn = None
         self._connect()
 
@@ -165,19 +175,76 @@ class DirectorSession(object):
         return isinstance(e, (bareos.exceptions.Error, OSError))
 
     def call(self, command):
-        with self._lock:
-            if self._conn is None:
-                self._connect()
-            try:
-                return self._conn.call(command)
-            except Exception as e:
-                if not self._connection_error(e):
-                    raise
-                self._close()
-                self._connect()
-                if str(command).lstrip().startswith(_READONLY_COMMANDS):
-                    return self._conn.call(command)
+        if self._conn is None:
+            self._connect()
+        try:
+            return self._conn.call(command)
+        except Exception as e:
+            if not self._connection_error(e):
                 raise
+            self._close()
+            self._connect()
+            if str(command).lstrip().startswith(_READONLY_COMMANDS):
+                return self._conn.call(command)
+            raise
+
+
+class DirectorSession(object):
+    """
+    The director connections of one API user, shared by every request of that
+    user. FastAPI runs (sync) endpoints concurrently in a threadpool, and
+    several clients may use the same login (e.g. a web app and its worker).
+
+    A small pool (CONFIG_DIRECTOR_POOL_SIZE): each call borrows one connection
+    exclusively — so no socket is ever used by two threads — and returns it
+    afterwards. The first connection is opened here (that is the credential
+    check of /token); more only while that many calls run at once, never more
+    than the pool size. With a pool of 1 every call of the user is serialized.
+    """
+
+    def __init__(self, username, password, size=None):
+        self._username = username
+        self._password = password
+        self._size = size or CONFIG_DIRECTOR_POOL_SIZE
+        self._idle = queue.LifoQueue()
+        self._guard = threading.Lock()
+        self._opening = 0
+        self._conns = [_DirectorConnection(username, password)]
+        self._idle.put(self._conns[0])
+
+    def _acquire(self):
+        try:
+            return self._idle.get_nowait()
+        except queue.Empty:
+            pass
+        # Reserve a slot under the lock, connect outside it (the TLS-PSK
+        # handshake must not block the other requests).
+        with self._guard:
+            grow = self._opening + len(self._conns) < self._size
+            if grow:
+                self._opening += 1
+        if not grow:
+            return self._idle.get()
+        try:
+            conn = _DirectorConnection(self._username, self._password)
+        finally:
+            with self._guard:
+                self._opening -= 1
+        with self._guard:
+            self._conns.append(conn)
+        return conn
+
+    def _close(self):
+        with self._guard:
+            for conn in self._conns:
+                conn._close()
+
+    def call(self, command):
+        conn = self._acquire()
+        try:
+            return conn.call(command)
+        finally:
+            self._idle.put(conn)
 
 
 class UserObject(object):

@@ -166,6 +166,25 @@ class HandshakeBusy(Exception):
 _CONNECT_LOCK_TIMEOUT = 30
 
 
+def _raw_console(user):
+    """A plain-text console for commands the JSON API doesn't serialize
+    (`status client=`, `status storage=`). Its handshake goes through
+    _CONNECT_LOCK like every other one: unserialized, it raced with the pool's
+    handshakes and broke both ("Assuming the connection is lost")."""
+    if not _CONNECT_LOCK.acquire(timeout=_CONNECT_LOCK_TIMEOUT):
+        raise HandshakeBusy("director handshake queue busy for %ss" % _CONNECT_LOCK_TIMEOUT)
+    try:
+        return bareos.bsock.DirectorConsole(
+            address=CONFIG_DIRECTOR_ADDRESS,
+            port=CONFIG_DIRECTOR_PORT,
+            dirname=CONFIG_DIRECTOR_NAME,
+            name=user.username,
+            password=bareos.bsock.Password(user.password),
+        )
+    finally:
+        _CONNECT_LOCK.release()
+
+
 class _DirectorConnection(object):
     """
     One director console connection, used by one request at a time (the
@@ -774,13 +793,7 @@ def client_health(
 
     raw_console = None
     try:
-        raw_console = bareos.bsock.DirectorConsole(
-            address=CONFIG_DIRECTOR_ADDRESS,
-            port=CONFIG_DIRECTOR_PORT,
-            dirname=CONFIG_DIRECTOR_NAME,
-            name=current_user.username,
-            password=bareos.bsock.Password(current_user.password),
-        )
+        raw_console = _raw_console(current_user)
         result = raw_console.call("status client=%s" % name)
     except Exception as e:
         return {"name": name, "reachable": False, "message": str(e)}
@@ -1886,13 +1899,7 @@ def read_job_live(
 
     raw_console = None
     try:
-        raw_console = bareos.bsock.DirectorConsole(
-            address=CONFIG_DIRECTOR_ADDRESS,
-            port=CONFIG_DIRECTOR_PORT,
-            dirname=CONFIG_DIRECTOR_NAME,
-            name=current_user.username,
-            password=bareos.bsock.Password(current_user.password),
-        )
+        raw_console = _raw_console(current_user)
         result = raw_console.call("status client=%s" % client)
     except Exception as e:
         # An FD that is unreachable mid-job is a valid answer, not a 5xx.
@@ -1921,13 +1928,7 @@ def _job_live_from_storages(current_user, base):
     raw_console = None
     parts = []
     try:
-        raw_console = bareos.bsock.DirectorConsole(
-            address=CONFIG_DIRECTOR_ADDRESS,
-            port=CONFIG_DIRECTOR_PORT,
-            dirname=CONFIG_DIRECTOR_NAME,
-            name=current_user.username,
-            password=bareos.bsock.Password(current_user.password),
-        )
+        raw_console = _raw_console(current_user)
         for name in names:
             try:
                 _validate_resource(name, "storage name")

@@ -49,9 +49,11 @@ import bareos.bsock
 import bareos.exceptions
 import bareos.util
 from bareos_restapi.models import *
+from bareos_restapi.catalog import Catalog
 
 # Read config from api.ini
-config = configparser.ConfigParser()
+# No interpolation: generated secrets (JWT, catalog password) may contain "%".
+config = configparser.ConfigParser(interpolation=None)
 config.read("api.ini")
 
 CONFIG_DIRECTOR_ADDRESS = config.get("Director", "Address")
@@ -92,6 +94,24 @@ CONFIG_ADMIN_CONSOLES = {
     for c in config.get("Director", "AdminConsoles", fallback="").split(",")
     if c.strip()
 }
+
+# Optional read-only catalog access (bareos_restapi/catalog.py): GET
+# /control/jobs without filters then reads the job list straight from the
+# catalog instead of `llist jobs` over the console. Only for AdminConsoles
+# (it bypasses the director's per-console ACLs), only for known schema
+# versions; any error falls back to the console. No [Catalog] section = off.
+CATALOG = None
+if config.has_section("Catalog"):
+    CATALOG = Catalog(
+        host=config.get("Catalog", "Host", fallback="127.0.0.1"),
+        port=config.getint("Catalog", "Port", fallback=5432),
+        dbname=config.get("Catalog", "Name", fallback="bareos"),
+        user=config.get("Catalog", "User"),
+        password=config.get("Catalog", "Password", fallback=""),
+        schema_versions=[
+            int(v) for v in config.get("Catalog", "SchemaVersions", fallback="2250").split(",") if v.strip()
+        ],
+    )
 
 # JSONL history of the daily restore check (bareos_dr's bareos-canary-check,
 # one record per check and per run), read-only for GET /control/restore-checks.
@@ -1939,7 +1959,32 @@ def read_all_jobs_status(
     limit: Optional[int] = Query(None, title="Result items limit", gt=1),
     offset: Optional[int] = Query(None, title="Result items offset", gt=0),
     jobQuery: Optional[jobQuery] = Body(None, title="Query parameter"),
+    source: Optional[str] = Query(
+        None, title="'console' forces llist jobs over the director (comparison/debugging)"
+    ),
 ):
+    # Same rows as `llist jobs`, straight from the catalog (see catalog.py).
+    if (
+        CATALOG is not None
+        and source != "console"
+        and jobQuery is None
+        and current_user.username in CONFIG_ADMIN_CONSOLES
+        and CATALOG.usable()
+    ):
+        try:
+            total, rows = CATALOG.list_jobs(limit=limit, offset=offset)
+        except Exception as e:
+            print("[catalog] list jobs failed (%s), using the console" % e)
+        else:
+            if not rows:
+                raise HTTPException(status_code=404, detail={"message": "No jobs found."})
+            result = {"totalItems": total}
+            if limit is not None:
+                result["limit"] = limit
+            if offset is not None:
+                result["offset"] = offset
+            response.headers["X-Bareos-Source"] = "catalog"
+            return {**result, "jobs": rows}
     return list_catalog_items(
         itemType="jobs",
         current_user=current_user,

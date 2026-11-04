@@ -78,6 +78,8 @@ setup(
         "passlib",
         "pydantic",
         "python-bareos",
+        # optional read-only catalog path (bareos_restapi/catalog.py)
+        "psycopg[binary]",
         "python-jose",
         # python-multipart: used by fastapi
         "python-multipart",

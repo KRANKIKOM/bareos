@@ -31,6 +31,7 @@ import re
 from datetime import datetime, timedelta
 from fastapi import Depends, FastAPI, HTTPException, status, Response, Path, Body, Query
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 import os
@@ -133,6 +134,13 @@ _READONLY_COMMANDS = (
 
 
 _CONNECT_LOCK = threading.Lock()
+# Guards users_db: /token runs in the threadpool, so logins of the same user
+# may race on its read-modify-write. Never held across network I/O.
+_USERS_LOCK = threading.Lock()
+
+
+class HandshakeBusy(Exception):
+    """Local queue for director handshakes is full — not a director verdict."""
 # Upper bound for waiting on another handshake: a hanging director (or a burst
 # of logins) must not block every other connection attempt forever.
 _CONNECT_LOCK_TIMEOUT = 30
@@ -161,7 +169,7 @@ class _DirectorConnection(object):
         # setups raced ("Could not read version from director"). Calls on
         # established connections stay parallel.
         if not _CONNECT_LOCK.acquire(timeout=_CONNECT_LOCK_TIMEOUT):
-            raise bareos.exceptions.ConnectionError(
+            raise HandshakeBusy(
                 "director handshake queue busy for %ss" % _CONNECT_LOCK_TIMEOUT
             )
         try:
@@ -306,34 +314,47 @@ def authenticate_user(username: str, password: str):
     # vouch for credentials the director may since have changed or revoked.
     try:
         session = DirectorSession(username, password)
+    except HandshakeBusy:
+        raise  # local overload, not a login verdict: keep every session (-> 503)
     except Exception as e:
         print(
             "Could not authorize %s at director %s. %s"
             % (username, CONFIG_DIRECTOR_NAME, e)
         )
-        # Only the cached password failing means the cached session is stale. A
-        # wrong password from someone else must not evict a working session.
-        stale = users_db.get(username)
-        if stale is not None and hmac.compare_digest(stale.password, password):
-            users_db.pop(username, None)
-            if isinstance(stale.jsonDirector, DirectorSession):
-                stale.jsonDirector._close()
+        # Only the director REJECTING the cached password means the cached
+        # session is stale. A wrong password from someone else, or a network
+        # problem, must not evict a working session.
+        stale = None
+        if isinstance(e, bareos.exceptions.AuthenticationError):
+            with _USERS_LOCK:
+                cached = users_db.get(username)
+                if cached is not None and hmac.compare_digest(cached.password, password):
+                    stale = users_db.pop(username)
+        if stale is not None and isinstance(stale.jsonDirector, DirectorSession):
+            stale.jsonDirector._close()
         return False
     # Same verified credentials → keep the existing session (in-flight requests
-    # use it) and drop the probe; otherwise the new session replaces it.
-    existing = users_db.get(username)
-    if (
-        existing is not None
-        and isinstance(existing.jsonDirector, DirectorSession)
-        and hmac.compare_digest(existing.password, password)
-    ):
-        session._close()
-        return existing
-    user = UserObject(username, password)
-    user.jsonDirector = session
-    user.username = username
-    users_db[username] = user
-    return user
+    # use it) and drop the probe; otherwise the new session replaces it. The
+    # session that is no longer referenced is closed (outside the lock).
+    drop = None
+    with _USERS_LOCK:
+        existing = users_db.get(username)
+        if (
+            existing is not None
+            and isinstance(existing.jsonDirector, DirectorSession)
+            and hmac.compare_digest(existing.password, password)
+        ):
+            keep, drop = existing, session
+        else:
+            keep = UserObject(username, password)
+            keep.jsonDirector = session
+            keep.username = username
+            users_db[username] = keep
+            if existing is not None and isinstance(existing.jsonDirector, DirectorSession):
+                drop = existing.jsonDirector
+    if drop is not None:
+        drop._close()
+    return keep
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
@@ -365,6 +386,11 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     if user is None:
         raise credentials_exception
     return user
+
+
+@app.exception_handler(HandshakeBusy)
+async def handshake_busy_handler(request, exc):
+    return JSONResponse(status_code=503, content={"detail": str(exc)}, headers={"Retry-After": "5"})
 
 
 @app.post("/token", response_model=Token)

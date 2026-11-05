@@ -436,6 +436,12 @@ class offsiteTargetClients(BaseModel):
     clients: List[str] = Field(..., title="Client names", max_length=2000)
 
 
+class offsiteTargetPause(BaseModel):
+    """Pause (true) or resume (false) the copies of an offsite target."""
+
+    paused: bool = Field(..., title="Paused")
+
+
 class restoreBvfsControl(BaseModel):
     """
     Multi-select restore driven by Bareos's BVFS catalog tables. Build a

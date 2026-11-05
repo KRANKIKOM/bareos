@@ -2732,10 +2732,15 @@ def read_restore_checks(
 #   <target>.clients  one client name per line (owned by this endpoint)
 #   <target>.pattern  the quoted Selection Pattern the job @includes, = sql with
 #                     the client list filled in (written by both)
+#   <target>.paused   present = the target is paused: .pattern then selects
+#                     nothing, so the scheduled copy job ends without copying.
+#                     A file, not `disable job=`, so it survives every reload
+#                     and Ansible run (Ansible honours it too).
 # Bareos cannot splice an @include into the middle of a quoted string, hence the
 # generated whole-pattern file.
 _RE_OFFSITE_TARGET = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 _OFFSITE_PLACEHOLDER = "@@CLIENTS@@"
+_OFFSITE_PAUSED_PATTERN = '"SELECT JobId FROM Job WHERE 1 = 0"\n'
 
 
 def _offsite_dir():
@@ -2751,7 +2756,7 @@ def _offsite_read_target(target):
             sql_lines = fh.read().splitlines()
     except FileNotFoundError:
         return None
-    meta = {"mode": "exclude", "job": None, "pool": None}
+    meta = {"mode": "exclude", "job": None, "pool": None, "paused": os.path.isfile(base + ".paused")}
     body = []
     for line in sql_lines:
         m = re.match(r"^--\s*([a-z_]{1,32}):\s*([A-Za-z0-9._-]{1,128})\s*$", line.strip())
@@ -2770,7 +2775,9 @@ def _offsite_read_target(target):
     return meta, " ".join(b for b in body if b), clients
 
 
-def _offsite_pattern(sql, clients):
+def _offsite_pattern(sql, clients, paused=False):
+    if paused:
+        return _OFFSITE_PAUSED_PATTERN
     # '__none__' keeps the IN () list valid when empty; names are [A-Za-z0-9._-].
     quoted = ",".join("'%s'" % c for c in ["__none__"] + clients)
     return '"%s"\n' % sql.replace(_OFFSITE_PLACEHOLDER, quoted)
@@ -2848,7 +2855,7 @@ def put_offsite_target(
             backups[ext] = None
     try:
         _write_resource_file(base + ".clients", "".join(c + "\n" for c in clients))
-        _write_resource_file(base + ".pattern", _offsite_pattern(sql, clients))
+        _write_resource_file(base + ".pattern", _offsite_pattern(sql, clients, meta["paused"]))
     except OSError as e:
         response.status_code = 500
         return {"message": "Could not write offsite target '%s': %s" % (target, e)}
@@ -2868,6 +2875,68 @@ def put_offsite_target(
             pass
         return reload_result
     return dict(meta, target=target, clients=clients, reload=reload_result)
+
+
+@app.put("/control/offsite-targets/{target}/paused", tags=["control"])
+def put_offsite_target_paused(
+    *,
+    response: Response,
+    current_user: User = Depends(get_current_user),
+    target: str = Path(..., title="Offsite target name"),
+    body: offsiteTargetPause = Body(..., embed=False),
+):
+    """
+    Pause or resume an offsite target and reload the director. Paused, its
+    selection finds no jobs: the copy job still runs on schedule but copies
+    nothing. Running copies are not touched (cancel them separately).
+    """
+    denied = _authorize_resource_op(current_user)
+    if denied:
+        response.status_code = 403
+        return {"message": denied}
+    if not _RE_OFFSITE_TARGET.match(target):
+        response.status_code = 400
+        return {"message": "target must match [a-z0-9-]{1,32}"}
+    read = _offsite_read_target(target)
+    if read is None:
+        response.status_code = 404
+        return {"message": "Unknown offsite target '%s'" % target}
+    meta, sql, clients = read
+    if _OFFSITE_PLACEHOLDER not in sql:
+        response.status_code = 500
+        return {"message": "%s.sql has no %s placeholder" % (target, _OFFSITE_PLACEHOLDER)}
+
+    base = os.path.join(_offsite_dir(), target)
+    try:
+        with open(base + ".pattern", "r", encoding="utf-8") as fh:
+            old_pattern = fh.read()
+    except FileNotFoundError:
+        old_pattern = None
+    try:
+        if body.paused:
+            _write_resource_file(base + ".paused", "")
+        elif os.path.isfile(base + ".paused"):
+            os.remove(base + ".paused")
+        _write_resource_file(base + ".pattern", _offsite_pattern(sql, clients, body.paused))
+    except OSError as e:
+        response.status_code = 500
+        return {"message": "Could not write offsite target '%s': %s" % (target, e)}
+
+    reload_result = _reload_after(
+        current_user, response, base + ".pattern", old_pattern,
+        "%s offsite target '%s'" % ("Paused" if body.paused else "Resumed", target),
+    )
+    if response.status_code is not None and response.status_code >= 400:
+        # Pattern is rolled back; put the marker back to how it was.
+        try:
+            if meta["paused"]:
+                _write_resource_file(base + ".paused", "")
+            elif os.path.isfile(base + ".paused"):
+                os.remove(base + ".paused")
+        except OSError:
+            pass
+        return reload_result
+    return dict(meta, target=target, clients=clients, paused=body.paused, reload=reload_result)
 
 
 def _volume_command(response, current_user, volume_name, template):

@@ -474,6 +474,11 @@ class restoreBvfsControl(BaseModel):
     replace: Optional[bareosReplaceOption] = Field(
         "never", title="File replace policy", example="never"
     )
+    restorejob: Optional[str] = Field(
+        None,
+        title="Restore Job resource; needed once the director has more than one",
+        example="RestoreFiles",
+    )
     jobids: str = Field(
         ...,
         title="JobIds (Full→Diff→Inc chain), comma-separated",

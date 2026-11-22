@@ -3792,6 +3792,11 @@ def runRestoreJobBvfs(
         )
         where = _validate_where(jobControl.where) if jobControl.where else None
         replace = _validate_replace(jobControl.replace)
+        restorejob = (
+            _validate_resource(jobControl.restorejob, "restorejob")
+            if jobControl.restorejob
+            else None
+        )
         fileid_arg = (
             _validate_id_list(jobControl.fileids, "fileids")
             if jobControl.fileids
@@ -3841,6 +3846,10 @@ def runRestoreJobBvfs(
         restore_parts.append("where=%s" % where)
     if replace:
         restore_parts.append("replace=%s" % replace)
+    # With two Restore jobs (RestoreFiles + the canary's RestoreCanary) the
+    # director would ask which one, and in API mode that fails.
+    if restorejob:
+        restore_parts.append("restorejob=%s" % restorejob)
     restore_cmd = " ".join(restore_parts)
 
     try:

@@ -2041,6 +2041,35 @@ def delete_job(
     return {"message": "Job %d succesfully deleted." % job_id}
 
 
+@app.put("/control/jobs/{job_id}/jobtype", tags=["jobcontrol", "control", "jobs"])
+def put_job_type(
+    *,
+    job_id: int = Path(..., title="The job whose catalog type changes", ge=1),
+    body: jobTypeUpdate = Body(..., embed=False),
+    response: Response,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Change the catalog type of a finished job (`update jobid=<id> jobtype=<t>`),
+    nothing else of the record. Dracula's SD move swaps original and copy with
+    it (B <-> M) instead of migrating, so the move can be taken back as long as
+    both sides exist. M rather than C for the inactive side: Bareos promotes a
+    C job to B when a job matching its PriorJobId is purged, and an original's
+    PriorJobId is 0, which matches every purged plain backup.
+    """
+    command = "update jobid=%d jobtype=%s" % (job_id, body.jobtype)
+    try:
+        current_user.jsonDirector.call(command)
+    except Exception as e:
+        response.status_code = 500
+        return {"message": "Could not run '%s' on director %s. Message: '%s'" % (command, CONFIG_DIRECTOR_NAME, e)}
+    job = read_job_status(job_id=job_id, response=response, current_user=current_user)
+    if job.get("type") != body.jobtype:
+        response.status_code = 500
+        return {"message": "Job %d has type %s after the update, not %s" % (job_id, job.get("type"), body.jobtype)}
+    return {"jobid": job_id, "type": body.jobtype}
+
+
 @app.get("/control/jobs/logs/{job_id}", tags=["jobcontrol", "control", "jobs"])
 def read_one_job_log(
     *,

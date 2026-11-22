@@ -442,6 +442,17 @@ class offsiteTargetPause(BaseModel):
     paused: bool = Field(..., title="Paused")
 
 
+class jobTypeUpdate(BaseModel):
+    """New catalog type of a job (`update jobid=<id> jobtype=<t>`)."""
+
+    jobtype: str = Field(
+        ...,
+        title="B = Backup, M = Migrated (never used, never promoted), C = Copy, A = Archive",
+        pattern="^[BMCA]$",
+        example="M",
+    )
+
+
 class restoreBvfsControl(BaseModel):
     """
     Multi-select restore driven by Bareos's BVFS catalog tables. Build a
